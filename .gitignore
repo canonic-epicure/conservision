@@ -12,5 +12,4 @@ wheels/
 # Virtual environments
 .venv
 
-/data/*
-!/data/benchmark.ipynb
+/data
