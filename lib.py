@@ -1,5 +1,11 @@
 import torch
 import torch.nn.functional as F
+from PIL import Image
+
+def get_resolution(filename):
+    with Image.open(filename) as img:
+        return f'{img.size[0]}x{img.size[1]}'
+
 
 def is_overexposed_torchvision(img_u8: torch.Tensor,
                                roi_border_frac: float = 0.05,
