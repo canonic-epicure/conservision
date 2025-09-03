@@ -12,4 +12,6 @@ wheels/
 # Virtual environments
 .venv
 
+/models
 /data
+/submission.csv

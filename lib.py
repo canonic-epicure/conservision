@@ -1,3 +1,5 @@
+from typing import Tuple
+
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -7,13 +9,15 @@ def get_resolution(filename):
         return f'{img.size[0]}x{img.size[1]}'
 
 
-def is_overexposed_torchvision(img_u8: torch.Tensor,
-                               roi_border_frac: float = 0.05,
-                               T_hi: int = 252,
-                               mu_thr: float = 240.0,
-                               sigma_thr: float = 8.0,
-                               p_hi_thr: float = 0.85,
-                               p_edge_thr: float = 0.02):
+def is_overexposed_torchvision(
+    img_u8: torch.Tensor,
+    roi_border_frac: float = 0.05,
+    T_hi: int = 240,
+    mu_thr: float = 240.0,
+    sigma_thr: float = 8.0,
+    p_hi_thr: float = 0.75,
+    p_edge_thr: float = 0.05
+):
     """
     img_u8: uint8 tensor [C,H,W] в диапазоне 0..255 (RGB)
     Возвращает (bool, dict метрик).
@@ -61,3 +65,47 @@ def is_overexposed_torchvision(img_u8: torch.Tensor,
         "p_hi": float(p_hi.item()),
         "p_edge": float(p_edge.item())
     }
+
+def to_rgb(img_u8: torch.Tensor):
+    if img_u8.shape[0] == 1:
+        img_u8 = img_u8.repeat(3, 1, 1)
+    return img_u8
+
+
+def background_template(img_batch: torch.Tensor) -> torch.Tensor:
+    assert img_batch.ndim == 4
+
+    return img_batch.median(dim=0).values
+
+
+def affine_params_to_background(x_i: torch.Tensor, background_i: torch.Tensor, eps:float =1e-6) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x_i.shape == background_i.shape, "x и background должны совпадать по форме."
+
+    x = x_i
+    background = background_i
+
+    # Средние и СКО по всем пикселям каждого канала
+    mux  = x.mean(dim=(1, 2))
+    sdx  = x.std(dim=(1, 2), unbiased=False).clamp_min(eps)
+    muB  = background.mean(dim=(1, 2))
+    sdB  = background.std(dim=(1, 2), unbiased=False).clamp_min(eps)
+
+    alpha = sdB / sdx            # (C,)
+    beta  = muB - alpha * mux    # (C,)
+
+    return alpha, beta
+
+def similarity(img1_u8: torch.Tensor, img2_u8: torch.Tensor) -> float:
+    img1_u8 = to_rgb(img1_u8)
+    img2_u8 = to_rgb(img2_u8)
+
+    assert img1_u8.dtype == torch.uint8 and img1_u8.ndim == 3 and img1_u8.shape[0] == 3
+    assert img2_u8.dtype == torch.uint8 and img2_u8.ndim == 3 and img2_u8.shape[0] == 3
+
+    C, H1, W1 = img1_u8.shape
+    C, H2, W2 = img2_u8.shape
+
+    assert H1 == H2 and W1 == W2
+
+
+
