@@ -220,10 +220,11 @@ class ImagesDatasetResnet(Dataset):
 
 
 class ForestDataset(Dataset):
-    def __init__(self, data: pd.DataFrame, labels: pd.DataFrame=None, processor=None):
+    def __init__(self, data: pd.DataFrame, labels: pd.DataFrame=None, processor=None, learning=False):
         self.data = data
         self.labels = labels
         self.processor = processor
+        self.learning = learning
 
     def __len__(self): return len(self.data)
 
