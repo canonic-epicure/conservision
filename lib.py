@@ -108,4 +108,65 @@ def similarity(img1_u8: torch.Tensor, img2_u8: torch.Tensor) -> float:
     assert H1 == H2 and W1 == W2
 
 
+import numpy as np
+import torch
+import torchvision.transforms as T
+from PIL import Image
+import cv2
 
+class LabCLAHE:
+    def __init__(self, clip_limit=2.0, tile_grid_size=(8, 8),
+                 apply_if_dark=True, dark_thr=0.35):
+        """
+        clip_limit: насколько ограничивать усиление контраста (>1 => сильнее).
+        tile_grid_size: размер сетки CLAHE (в плитках).
+        apply_if_dark: если True, применяем CLAHE только для "тёмных" кадров.
+        dark_thr: порог по средней яркости L в [0,1], ниже которого включаем CLAHE.
+        """
+        self.clip_limit = clip_limit
+        self.tile_grid_size = tile_grid_size
+        self.apply_if_dark = apply_if_dark
+        self.dark_thr = dark_thr
+
+        self.to_tensor = T.ToTensor()
+        self.to_pil = T.ToPILImage()
+
+    @torch.no_grad()
+    def __call__(self, img):
+        # Приводим к numpy uint8 RGB [0..255]
+        if isinstance(img, torch.Tensor):
+            # ожидаем CxHxW, [0,1]
+            x = (img.clamp(0,1).mul(255).byte().permute(1,2,0).cpu().numpy())
+        elif isinstance(img, Image.Image):
+            x = np.array(img)  # HxWxC, uint8, RGB
+        else:
+            raise TypeError("img must be PIL.Image or torch.Tensor")
+
+        # RGB -> Lab (OpenCV ожидает RGB во флаге COLOR_RGB2LAB)
+        lab = cv2.cvtColor(x, cv2.COLOR_RGB2LAB)  # uint8
+        L = lab[:,:,0]        # L в [0..255]
+        a = lab[:,:,1]        # a в [0..255] со сдвигом 128
+        b = lab[:,:,2]        # b в [0..255] со сдвигом 128
+
+        # Критерий "темноты" по средней L (нормируем к [0,1])
+        mean_L = L.mean() / 255.0
+
+        do_apply = True
+        if self.apply_if_dark:
+            do_apply = (mean_L < self.dark_thr)
+
+        if do_apply:
+            clahe = cv2.createCLAHE(clipLimit=self.clip_limit,
+                                    tileGridSize=self.tile_grid_size)
+            L_eq = clahe.apply(L)
+        else:
+            L_eq = L  # оставляем как есть
+
+        lab_eq = np.stack([L_eq, a, b], axis=2).astype(np.uint8)
+
+        # Lab -> RGB
+        rgb_eq = cv2.cvtColor(lab_eq, cv2.COLOR_Lab2RGB)  # uint8
+
+        # обратно к тензору [0,1], CxHxW
+        out = torch.from_numpy(rgb_eq).permute(2,0,1).float() / 255.0
+        return out
