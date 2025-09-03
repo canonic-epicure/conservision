@@ -1,8 +1,20 @@
 from typing import Tuple
 
+import cv2
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
+import torchvision.transforms as T
 from PIL import Image
+from torch.utils.data import Dataset
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import v2
+
+from pathlib import Path
+
+import lib
+
 
 def get_resolution(filename):
     with Image.open(filename) as img:
@@ -108,12 +120,6 @@ def similarity(img1_u8: torch.Tensor, img2_u8: torch.Tensor) -> float:
     assert H1 == H2 and W1 == W2
 
 
-import numpy as np
-import torch
-import torchvision.transforms as T
-from PIL import Image
-import cv2
-
 class LabCLAHE:
     def __init__(self, clip_limit=2.0, tile_grid_size=(8, 8),
                  apply_if_dark=True, dark_thr=0.35):
@@ -170,3 +176,124 @@ class LabCLAHE:
         # обратно к тензору [0,1], CxHxW
         out = torch.from_numpy(rgb_eq).permute(2,0,1).float() / 255.0
         return out
+
+
+class ImagesDatasetResnet(Dataset):
+    def __init__(self, x_df, y_df=None, learning=True):
+        self.data = x_df
+        self.label = y_df
+
+        self.transform = v2.Compose(
+            [
+                lib.LabCLAHE(),
+                v2.ToPILImage(),
+
+                v2.ColorJitter() if learning else lambda x: x,
+                v2.RandomAutocontrast() if learning else lambda x: x,
+                v2.RandomEqualize() if learning else lambda x: x,
+                v2.RandomAdjustSharpness(sharpness_factor=1.5) if learning else lambda x: x,
+                v2.RandomHorizontalFlip() if learning else lambda x: x,
+                v2.RandomRotation(degrees=15, interpolation=InterpolationMode.BICUBIC) if learning else lambda x: x,
+
+                v2.Resize((224, 224), interpolation=InterpolationMode.BICUBIC),
+                v2.ToDtype(torch.float32, scale=True)(),
+                v2.Normalize(
+                    mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)
+                ),
+            ]
+        )
+
+    def __getitem__(self, index):
+        image = Image.open('data/' + self.data.iloc[index]["filepath"]).convert("RGB")
+        image = self.transform(image)
+        image_id = self.data.index[index]
+        # if we don't have labels (e.g. for test set) just return the image and image id
+        if self.label is None:
+            sample = {"image_id": image_id, "image": image}
+        else:
+            label = torch.tensor(self.label.iloc[index].values, dtype=torch.float)
+            sample = {"image_id": image_id, "image": image, "label": label}
+        return sample
+
+    def __len__(self):
+        return len(self.data)
+
+
+class ForestDataset(Dataset):
+    def __init__(self, data: pd.DataFrame, labels: pd.DataFrame=None, processor=None):
+        self.data = data
+        self.labels = labels
+        self.processor = processor
+
+    def __len__(self): return len(self.data)
+
+    def __getitem__(self, idx):
+        img = Image.open('data/' + self.data.iloc[idx]["filepath"]).convert("RGB")
+        image_id = self.data.index[idx]
+
+        # enc["pixel_values"]: (1, C, H, W) -> уберём размерность 0
+        enc = self.processor(images=img, return_tensors="pt")
+        if self.labels is None:
+            return {
+                "image_id": image_id,
+                "pixel_values": enc["pixel_values"].squeeze(0)
+            }
+        else:
+            return {
+                "image_id": image_id,
+                "pixel_values": enc["pixel_values"].squeeze(0),
+                "labels": torch.tensor(self.labels.iloc[idx].values, dtype=torch.float)
+            }
+
+    # def collate_fn(batch):
+    #     pixel_values = torch.stack([b["pixel_values"] for b in batch], dim=0)
+    #     labels = torch.stack([b["labels"] for b in batch], dim=0)
+    #     return {"pixel_values": pixel_values, "labels": labels}
+
+
+
+# class ImagesDatasetSiglip2(Dataset):
+#     def __init__(self, x_df, y_df=None, learning=True):
+#         self.data = x_df
+#         self.label = y_df
+#
+#         self.transform = v2.Compose(
+#             [
+#                 lib.LabCLAHE(),
+#                 v2.ToPILImage(),
+#
+#                 v2.ColorJitter() if learning else lambda x: x,
+#                 v2.RandomAutocontrast() if learning else lambda x: x,
+#                 v2.RandomEqualize() if learning else lambda x: x,
+#                 v2.RandomAdjustSharpness(sharpness_factor=1.5) if learning else lambda x: x,
+#                 v2.RandomHorizontalFlip() if learning else lambda x: x,
+#                 v2.RandomRotation(degrees=15, interpolation=InterpolationMode.BICUBIC) if learning else lambda x: x,
+#
+#                 v2.Resize((224, 224), interpolation=InterpolationMode.BICUBIC),
+#                 v2.ToDtype(torch.float32, scale=True)(),
+#                 v2.Normalize(
+#                     mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)
+#                 ),
+#             ]
+#         )
+#
+#     def __getitem__(self, index):
+#         image = Image.open('data/' + self.data.iloc[index]["filepath"]).convert("RGB")
+#         image = self.transform(image)
+#         image_id = self.data.index[index]
+#         # if we don't have labels (e.g. for test set) just return the image and image id
+#         if self.label is None:
+#             sample = {"image_id": image_id, "image": image}
+#         else:
+#             label = torch.tensor(self.label.iloc[index].values, dtype=torch.float)
+#             sample = {"image_id": image_id, "image": image, "label": label}
+#         return sample
+#
+#     def __len__(self):
+#         return len(self.data)
+
+
+def save_model(model, file_name: str):
+    Path(file_name).parent.mkdir(parents=True, exist_ok=True)
+
+    torch.save(model, file_name)
