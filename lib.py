@@ -1,3 +1,6 @@
+import glob
+import re
+from pathlib import Path
 from typing import Tuple, List
 
 import cv2
@@ -6,14 +9,11 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 import torchvision.transforms as T
+import tqdm
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import v2
-
-from pathlib import Path
-import glob
-import re
 
 import lib
 
@@ -286,3 +286,42 @@ def model_checkpoints(glob_pattern: str) -> List[str]:
     epochs.sort(reverse=True)
 
     return epochs
+
+
+def predict_siglip(model, data_loader: DataLoader, accumulate_probs=True, accumulate_loss=False, T=1, desc='Predicting', criterion=None, columns=None):
+    preds_collector = []
+
+    # put the model in eval mode so we don't update any parameters
+    model.eval()
+
+    model.to(torch.device("cuda"))
+
+    loss_acc = 0
+    count = 0
+
+    # we aren't updating our weights so no need to calculate gradients
+    with torch.no_grad():
+        for batch in tqdm.tqdm(data_loader, total=len(data_loader), desc=desc):
+            # 1) run the forward step
+            logits = model.forward(batch["pixel_values"].to(torch.device("cuda"))).logits
+
+            if accumulate_loss:
+                loss = criterion(logits, batch["labels"].to('cuda'))
+
+                c = batch['pixel_values'].size(0)
+                loss_acc += loss.item() * c
+                count += c
+
+            if accumulate_probs:
+                # 2) apply softmax so that model outputs are in range [0,1]
+                preds = F.softmax(logits / T, dim=1)
+                # 3) store this batch's predictions in df
+                # note that PyTorch Tensors need to first be detached from their computational graph before converting to numpy arrays
+                preds_df = pd.DataFrame(
+                    preds.detach().to('cpu').numpy(),
+                    index=batch["image_id"],
+                    columns=columns,
+                )
+                preds_collector.append(preds_df)
+
+    return pd.concat(preds_collector) if accumulate_probs else None, loss_acc / count if accumulate_loss else None
