@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Tuple, List
 
 import cv2
 import numpy as np
@@ -12,6 +12,8 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import v2
 
 from pathlib import Path
+import glob
+import re
 
 import lib
 
@@ -219,8 +221,22 @@ class ImagesDatasetResnet(Dataset):
         return len(self.data)
 
 
-class ForestDataset(Dataset):
-    def __init__(self, data: pd.DataFrame, labels: pd.DataFrame=None, processor=None, learning=False):
+siglip2_training_transform = v2.Compose(
+    [
+        lib.LabCLAHE(),
+        v2.ToPILImage(),
+
+        v2.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.05),
+        v2.RandomAutocontrast(p=0.1),
+        v2.RandomEqualize(p=0.1),
+        v2.RandomAdjustSharpness(p=0.3, sharpness_factor=1.5),
+        v2.RandomHorizontalFlip(p=0.5),
+        v2.RandomRotation(degrees=15, interpolation=InterpolationMode.BICUBIC),
+    ]
+)
+
+class ImageDatasetSigLip2(Dataset):
+    def __init__(self, data: pd.DataFrame, labels: pd.DataFrame=None, processor=None, learning=True):
         self.data = data
         self.labels = labels
         self.processor = processor
@@ -231,6 +247,9 @@ class ForestDataset(Dataset):
     def __getitem__(self, idx):
         img = Image.open('data/' + self.data.iloc[idx]["filepath"]).convert("RGB")
         image_id = self.data.index[idx]
+
+        if self.learning:
+            img = siglip2_training_transform(img)
 
         # enc["pixel_values"]: (1, C, H, W) -> уберём размерность 0
         enc = self.processor(images=img, return_tensors="pt")
@@ -252,49 +271,18 @@ class ForestDataset(Dataset):
     #     return {"pixel_values": pixel_values, "labels": labels}
 
 
-
-# class ImagesDatasetSiglip2(Dataset):
-#     def __init__(self, x_df, y_df=None, learning=True):
-#         self.data = x_df
-#         self.label = y_df
-#
-#         self.transform = v2.Compose(
-#             [
-#                 lib.LabCLAHE(),
-#                 v2.ToPILImage(),
-#
-#                 v2.ColorJitter() if learning else lambda x: x,
-#                 v2.RandomAutocontrast() if learning else lambda x: x,
-#                 v2.RandomEqualize() if learning else lambda x: x,
-#                 v2.RandomAdjustSharpness(sharpness_factor=1.5) if learning else lambda x: x,
-#                 v2.RandomHorizontalFlip() if learning else lambda x: x,
-#                 v2.RandomRotation(degrees=15, interpolation=InterpolationMode.BICUBIC) if learning else lambda x: x,
-#
-#                 v2.Resize((224, 224), interpolation=InterpolationMode.BICUBIC),
-#                 v2.ToDtype(torch.float32, scale=True)(),
-#                 v2.Normalize(
-#                     mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)
-#                 ),
-#             ]
-#         )
-#
-#     def __getitem__(self, index):
-#         image = Image.open('data/' + self.data.iloc[index]["filepath"]).convert("RGB")
-#         image = self.transform(image)
-#         image_id = self.data.index[index]
-#         # if we don't have labels (e.g. for test set) just return the image and image id
-#         if self.label is None:
-#             sample = {"image_id": image_id, "image": image}
-#         else:
-#             label = torch.tensor(self.label.iloc[index].values, dtype=torch.float)
-#             sample = {"image_id": image_id, "image": image, "label": label}
-#         return sample
-#
-#     def __len__(self):
-#         return len(self.data)
-
-
-def save_model(model, file_name: str):
+def save_model(model, optimizer, file_name: str):
     Path(file_name).parent.mkdir(parents=True, exist_ok=True)
 
-    torch.save(model, file_name)
+    torch.save({'model' : model, 'optimizer': optimizer}, file_name)
+
+def model_checkpoints(glob_pattern: str) -> List[str]:
+    files = glob.glob(glob_pattern)
+
+    pattern = re.compile(r"checkpoint_(\d+)\.pth$")
+
+    epochs = [ pattern.search(file)[1] for file in files if pattern.search(file) != None ]
+
+    epochs.sort(reverse=True)
+
+    return epochs
