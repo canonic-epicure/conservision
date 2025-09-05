@@ -73,8 +73,10 @@ def detect_day_night(
 
     for i, img in enumerate(imgs):
         x = img.to(device)  # (3,H,W) в [0,1]
-        hsv = TF.rgb_to_hsv(x.unsqueeze(0))  # (1,3,H,W)
-        V   = hsv[0, 2]  # (H,W), яркость
+        # hsv = TF.rgb_to_hsv(x.unsqueeze(0))  # (1,3,H,W)
+        # V   = hsv[0, 2]  # (H,W), яркость
+        # x: (3, H, W) в [0,1]
+        V = x.max(dim=0).values  # (H, W), это и есть канал V (Value)
         H_, W_ = V.shape
 
         # средняя яркость

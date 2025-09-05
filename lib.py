@@ -143,9 +143,11 @@ class LabCLAHE:
     def __call__(self, img):
         # Приводим к numpy uint8 RGB [0..255]
         if isinstance(img, torch.Tensor):
+            img = to_rgb(img)
             # ожидаем CxHxW, [0,1]
             x = (img.clamp(0,1).mul(255).byte().permute(1,2,0).cpu().numpy())
         elif isinstance(img, Image.Image):
+            img = img.convert("RGB")
             x = np.array(img)  # HxWxC, uint8, RGB
         else:
             raise TypeError("img must be PIL.Image or torch.Tensor")
@@ -188,6 +190,7 @@ class ImagesDatasetResnet(Dataset):
         self.transform = v2.Compose(
             [
                 lib.LabCLAHE(),
+                lib.LabCLAHE(),
                 v2.ToPILImage(),
 
                 v2.ColorJitter() if learning else lambda x: x,
@@ -223,6 +226,7 @@ class ImagesDatasetResnet(Dataset):
 
 siglip2_training_transform = v2.Compose(
     [
+        lib.LabCLAHE(),
         lib.LabCLAHE(),
         v2.ToPILImage(),
 
