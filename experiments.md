@@ -3,6 +3,8 @@
 - manual data cleanup? 
 
 - weights for classes in log loss
+- or sampler 
+
 - select temperature on validation (grid search)
 
 - Focal loss ??

@@ -15,7 +15,9 @@ from torch.utils.data import Dataset, DataLoader
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms import v2
 
-import lib
+import random
+
+import photo
 
 
 def get_resolution(filename):
@@ -182,6 +184,25 @@ class LabCLAHE:
         return out
 
 
+class RandomInvertIfGrayscale:
+    def __init__(self, p=0.5):
+        self.p = p
+        self.invert = v2.RandomInvert(p=1.0)
+
+    @torch.no_grad()
+    def __call__(self, img):
+        if not isinstance(img, Image.Image):
+            raise TypeError("img must be PIL.Image ")
+
+        is_grayscale, _ = photo.looks_grayscale_ycbcr_cv(img)
+
+        # no-op if image is not grayscale or random.random() > self.p
+        if not is_grayscale or random.random() > self.p:
+            return img
+
+        return self.invert(img)
+
+
 class ImagesDatasetResnet(Dataset):
     def __init__(self, x_df, y_df=None, learning=True):
         self.data = x_df
@@ -189,8 +210,8 @@ class ImagesDatasetResnet(Dataset):
 
         self.transform = v2.Compose(
             [
-                lib.LabCLAHE(),
-                lib.LabCLAHE(),
+                LabCLAHE(),
+                LabCLAHE(),
                 v2.ToPILImage(),
 
                 v2.ColorJitter() if learning else lambda x: x,
@@ -226,8 +247,10 @@ class ImagesDatasetResnet(Dataset):
 
 siglip2_training_transform = v2.Compose(
     [
-        lib.LabCLAHE(),
-        lib.LabCLAHE(),
+        RandomInvertIfGrayscale(p=0.3),
+
+        LabCLAHE(),
+        LabCLAHE(),
         v2.ToPILImage(),
 
         v2.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.05),
@@ -329,3 +352,70 @@ def predict_siglip(model, data_loader: DataLoader, accumulate_probs=True, accumu
                 preds_collector.append(preds_df)
 
     return pd.concat(preds_collector) if accumulate_probs else None, loss_acc / count if accumulate_loss else None
+
+
+
+def predict_siglip_ten_crop(model, data_loader: DataLoader, T=1, desc='Predicting', columns=None):
+    preds_collector = []
+
+    # put the model in eval mode so we don't update any parameters
+    model.eval()
+
+    model.to(torch.device("cuda"))
+
+    # we aren't updating our weights so no need to calculate gradients
+    with torch.no_grad():
+        for batch in tqdm.tqdm(data_loader, total=len(data_loader), desc=desc):
+            def process_image(image):
+                w, h = image.shape[1:]
+
+                resize = v2.Resize(size=(round(w * 1.5), round(h * 1.5)), interpolation=v2.InterpolationMode.BICUBIC)
+                ten_crop = v2.TenCrop(size=(w, h))
+
+                ten_crop_img = torch.stack(list(ten_crop(resize(image))))
+
+                # 1) run the forward step
+                logits = model.forward(ten_crop_img.to(torch.device('cuda'))).logits / T
+
+                logp = F.log_softmax(logits, dim=1)  # (M, K)
+                logp_mean = torch.logsumexp(logp, dim=0) - torch.log(torch.tensor(ten_crop_img.size(0)))  # (K,)
+
+                return torch.exp(logp_mean).detach().to('cpu').numpy()
+
+            process_image(batch["pixel_values"][0])
+
+            preds_df = pd.DataFrame(
+                [ process_image(image) for image in batch["pixel_values"] ],
+                index=batch["image_id"],
+                columns=columns,
+            )
+            preds_collector.append(preds_df)
+
+    return pd.concat(preds_collector)
+
+
+# import math, torch
+# import torch.nn.functional as F
+# from torchvision import transforms
+# from PIL import Image
+#
+# v2.TenCrop(size=)
+#
+# # 1) TTA-трансформа: Resize→FiveCrop(384) + hflip для каждого кропа
+# resize_448 = transforms.Resize(448, antialias=True)
+# fivecrop   = transforms.FiveCrop(384)
+#
+# def make_tta_views(img: Image.Image):
+#     crops = list(fivecrop(img))                  # 5 PIL-изображений
+#     flips = [transforms.functional.hflip(c) for c in crops]
+#     return crops + flips                         # всего M=10
+#
+# # 2) Прогоняем через processor→model и агрегируем лог-вероятности
+# @torch.no_grad()
+# def tta_logprob_mean(model, processor, img: Image.Image, device="cuda"):
+#     views = make_tta_views(img)                                  # M PIL
+#     enc = processor(images=views, return_tensors="pt")           # батч M
+#     logits = model(enc["pixel_values"].to(device)).logits        # (M, K)
+#     logp = F.log_softmax(logits, dim=1)                          # (M, K)
+#     logp_mean = torch.logsumexp(logp, dim=0) - math.log(len(views))  # (K,)
+#     return logp_mean  # агрегированные лог-вероятности по классам

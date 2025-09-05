@@ -15,4 +15,4 @@ wheels/
 /models
 /models_siglip2
 /data
-/submission.csv
+/submission*.csv
