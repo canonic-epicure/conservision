@@ -330,7 +330,7 @@ def predict_siglip(model, data_loader: DataLoader, accumulate_probs=True, accumu
     with torch.no_grad():
         for batch in tqdm.tqdm(data_loader, total=len(data_loader), desc=desc):
             # 1) run the forward step
-            logits = model.forward(batch["pixel_values"].to(torch.device("cuda"))).logits
+            logits = model.forward(batch["pixel_values"].to(torch.device("cuda"))).logits / T
 
             if accumulate_loss:
                 loss = criterion(logits, batch["labels"].to('cuda'))
