@@ -1,40 +1,36 @@
+import argparse
+import random
 import sys
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
-import torch.backends.cudnn as cudnn
-import torchvision
+import torch.optim as optim
 import torchvision.models as models
-import random
-import os
-import argparse
-import numpy as np
-from torch.utils.data import DataLoader
-from torchvision.models import \
-    ResNet50_Weights
-
 import tqdm
-
-from pathlib import Path
+from sklearn.mixture import GaussianMixture
+from torch.utils.data import DataLoader
+from torchvision.models import ResNet50_Weights
+from transformers import AutoImageProcessor, AutoModelForImageClassification
 
 import data
 import dividemix_dataloader as dataloader
-from sklearn.mixture import GaussianMixture
 
 parser = argparse.ArgumentParser(description='DivideMix training')
+parser.add_argument('--checkpoint_dir', default='dividemix_checkpoints', type=str, help='directory for checkpoints')
 parser.add_argument('--batch_size', default=32, type=int, help='train batchsize')
-parser.add_argument('--lr', '--learning_rate', default=0.002, type=float, help='initial learning rate')
+# parser.add_argument('--lr', '--learning_rate', default=0.002, type=float, help='initial learning rate')
 parser.add_argument('--alpha', default=0.5, type=float, help='parameter for Beta')
-parser.add_argument('--lambda_u', default=0, type=float, help='weight for unsupervised loss')
+# parser.add_argument('--lambda_u', default=0, type=float, help='weight for unsupervised loss')
 parser.add_argument('--p_threshold', default=0.5, type=float, help='clean probability threshold')
-parser.add_argument('--T', default=0.5, type=float, help='sharpening temperature')
-parser.add_argument('--num_epochs', default=80, type=int)
-parser.add_argument('--id', default='clothing1m')
-parser.add_argument('--data_path', default='../../Clothing1M/data', type=str, help='path to dataset')
+# parser.add_argument('--T', default=0.5, type=float, help='sharpening temperature')
+parser.add_argument('--num_epochs', default=5, type=int)
+# parser.add_argument('--data_path', default='../../Clothing1M/data', type=str, help='path to dataset')
 parser.add_argument('--seed', default=123)
 parser.add_argument('--gpuid', default=0, type=int)
-parser.add_argument('--num_class', default=8, type=int)
+# parser.add_argument('--num_class', default=8, type=int)
 args = parser.parse_args()
 
 torch.cuda.set_device(args.gpuid)
@@ -42,6 +38,7 @@ random.seed(args.seed)
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed_all(args.seed)
 
+num_class = len(data.species_labels)
 
 # Training
 def train(epoch, net1, net2, optimizer, labeled_trainloader, unlabeled_trainloader):
@@ -122,10 +119,10 @@ def train(epoch, net1, net2, optimizer, labeled_trainloader, unlabeled_trainload
         loss.backward()
         optimizer.step()
 
-        sys.stdout.write('\r')
-        sys.stdout.write('Clothing1M | Epoch [%3d/%3d] Iter[%3d/%3d]\t  Labeled loss: %.4f '
-                         % (epoch, args.num_epochs, batch_idx + 1, num_iter, Lx.item()))
-        sys.stdout.flush()
+        # sys.stdout.write('\r')
+        # sys.stdout.write('Clothing1M | Epoch [%3d/%3d] Iter[%3d/%3d]\t  Labeled loss: %.4f '
+        #                  % (epoch, args.num_epochs, batch_idx + 1, num_iter, Lx.item()))
+        # sys.stdout.flush()
 
 
 def warmup(net, optimizer, dataloader):
@@ -183,13 +180,16 @@ def test(net1, net2, test_loader):
     with torch.no_grad():
         for batch_idx, (inputs, targets, ids) in enumerate(test_loader):
             inputs, targets = inputs.cuda(), targets.cuda()
+
             outputs1 = net1(inputs)
             outputs2 = net2(inputs)
             outputs = outputs1 + outputs2
+
+            _, target_idx = torch.max(targets, dim=1)
             _, predicted = torch.max(outputs, 1)
 
             total += targets.size(0)
-            correct += predicted.eq(targets).cpu().sum().item()
+            correct += predicted.eq(target_idx).cpu().sum().item()
     acc = 100. * correct / total
     print("\n| Test Acc: %.2f%%\n" % (acc))
     return acc
@@ -216,9 +216,9 @@ def eval_train(epoch, model, eval_loader: DataLoader):
             #     losses[n] = loss[b]
             #     paths.append(id[b])
             #     n += 1
-            sys.stdout.write('\r')
-            sys.stdout.write('| Evaluating loss Iter %3d\t' % (batch_idx))
-            sys.stdout.flush()
+            # sys.stdout.write('\r')
+            # sys.stdout.write('| Evaluating loss Iter %3d\t' % (batch_idx))
+            # sys.stdout.flush()
 
     losses = (losses - losses.min()) / (losses.max() - losses.min())
     losses = losses.reshape(-1, 1)
@@ -238,15 +238,33 @@ class NegEntropy(object):
         return torch.mean(torch.sum(probs.log() * probs, dim=1))
 
 
-def create_model():
+def create_model_siglip2_base_256(num_labels):
+    model_id = "google/siglip2-base-patch16-256"  # FixRes вариант
+
+    model = AutoModelForImageClassification.from_pretrained(
+        model_id,
+        num_labels=num_labels,
+        ignore_mismatched_sizes=True,  # создаст новую голову нужного размера
+    )
+
+    model.cuda()
+
+    model.tracking_loss = []
+    model.tracking_loss_val = []
+    model.tracking_accuracy = []
+    model.tracking_val_probs = []
+    # the last epoch we finished training on
+    model.epoch = None
+
+    return model, AutoImageProcessor.from_pretrained(model_id)
+
+
+def create_model_resnet_50(num_labels):
     model = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
-    model.fc = nn.Linear(2048, args.num_class)
+    model.fc = nn.Linear(2048, num_labels)
     model = model.cuda()
     return model
 
-
-# log = open('./checkpoint/%s.txt' % args.id, 'w')
-# log.flush()
 
 loader = dataloader.DividemixDataloaderFactory(
     data_dir=Path(__file__).parent / 'data',
@@ -258,10 +276,13 @@ loader = dataloader.DividemixDataloaderFactory(
     y_eval=data.y_eval,
 )
 
-print('| Building net')
-net1 = create_model()
-net2 = create_model()
-# cudnn.benchmark = True
+print('| Building net1')
+net1 = create_model_resnet_50(args.num_class)
+print('| Building net2')
+net2 = create_model_resnet_50(args.num_class)
+
+# net1 = create_model_siglip2_base_256(args.num_class)
+# net2 = create_model_siglip2_base_256(args.num_class)
 
 # optimizer1 = optim.SGD(net1.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-3)
 # optimizer2 = optim.SGD(net2.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-3)
@@ -272,8 +293,6 @@ optimizer2 = optim.AdamW(net2.parameters(), lr=args.lr, weight_decay=1e-3)
 CE = nn.CrossEntropyLoss(reduction='none')
 CEloss = nn.CrossEntropyLoss()
 conf_penalty = NegEntropy()
-
-best_acc = [0, 0]
 
 for epoch in range(args.num_epochs + 1):
     lr = args.lr
@@ -310,9 +329,6 @@ for epoch in range(args.num_epochs + 1):
 
     print(f'Validation Epoch:{ epoch }      Acc1: {acc1:.2f}  Acc2:{acc2:.2f}')
 
-    # log.write()
-    # log.flush()
-
     print('\n==== net 1 evaluate next epoch training data loss ====')
     eval_loader = loader.get_eval_train_dataloader()  # evaluate training data loss for next epoch
     prob1, ids1 = eval_train(epoch, net1, eval_loader)
@@ -321,10 +337,7 @@ for epoch in range(args.num_epochs + 1):
     eval_loader = loader.get_eval_train_dataloader()
     prob2, ids2 = eval_train(epoch, net2, eval_loader)
 
-test_loader = loader.run('test')
-# net1.load_state_dict(torch.load('./checkpoint/%s_net1.pth.tar' % args.id))
-# net2.load_state_dict(torch.load('./checkpoint/%s_net2.pth.tar' % args.id))
+test_loader = loader.get_test_dataloader()
 acc = test(net1, net2, test_loader)
 
 print('Test Accuracy:%.2f\n' % (acc))
-# log.flush()
