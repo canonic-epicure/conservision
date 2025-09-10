@@ -15,30 +15,29 @@ from torch.utils.data import DataLoader
 from torchvision.models import ResNet50_Weights
 from transformers import AutoImageProcessor, AutoModelForImageClassification
 
-import data
 import dividemix_dataloader as dataloader
+
+import data
 
 parser = argparse.ArgumentParser(description='DivideMix training')
 parser.add_argument('--checkpoint_dir', default='dividemix_checkpoints', type=str, help='directory for checkpoints')
 parser.add_argument('--batch_size', default=32, type=int, help='train batchsize')
-# parser.add_argument('--lr', '--learning_rate', default=0.002, type=float, help='initial learning rate')
+parser.add_argument('--lr', '--learning_rate', default=0.001, type=float, help='initial learning rate')
 parser.add_argument('--alpha', default=0.5, type=float, help='parameter for Beta')
 # parser.add_argument('--lambda_u', default=0, type=float, help='weight for unsupervised loss')
 parser.add_argument('--p_threshold', default=0.5, type=float, help='clean probability threshold')
-# parser.add_argument('--T', default=0.5, type=float, help='sharpening temperature')
+parser.add_argument('--T', default=0.5, type=float, help='sharpening temperature')
 parser.add_argument('--num_epochs', default=5, type=int)
 # parser.add_argument('--data_path', default='../../Clothing1M/data', type=str, help='path to dataset')
 parser.add_argument('--seed', default=123)
 parser.add_argument('--gpuid', default=0, type=int)
-# parser.add_argument('--num_class', default=8, type=int)
+parser.add_argument('--num_class', default=len(data.species_labels), type=int)
 args = parser.parse_args()
 
 torch.cuda.set_device(args.gpuid)
 random.seed(args.seed)
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed_all(args.seed)
-
-num_class = len(data.species_labels)
 
 # Training
 def train(epoch, net1, net2, optimizer, labeled_trainloader, unlabeled_trainloader):
@@ -252,7 +251,7 @@ def create_model_siglip2_base_256(num_labels):
     model.tracking_loss = []
     model.tracking_loss_val = []
     model.tracking_accuracy = []
-    model.tracking_val_probs = []
+    # model.tracking_val_probs = []
     # the last epoch we finished training on
     model.epoch = None
 
@@ -276,13 +275,12 @@ loader = dataloader.DividemixDataloaderFactory(
     y_eval=data.y_eval,
 )
 
-print('| Building net1')
-net1 = create_model_resnet_50(args.num_class)
-print('| Building net2')
-net2 = create_model_resnet_50(args.num_class)
+print('| Building net')
+# net1 = create_model_resnet_50(args.num_class)
+# net2 = create_model_resnet_50(args.num_class)
 
-# net1 = create_model_siglip2_base_256(args.num_class)
-# net2 = create_model_siglip2_base_256(args.num_class)
+net1 = create_model_siglip2_base_256(args.num_class)
+net2 = create_model_siglip2_base_256(args.num_class)
 
 # optimizer1 = optim.SGD(net1.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-3)
 # optimizer2 = optim.SGD(net2.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-3)

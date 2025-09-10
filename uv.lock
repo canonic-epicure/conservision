@@ -297,7 +297,7 @@ wheels = [
 ]
 
 [[package]]
-name = "conservision-benchmark"
+name = "conservision"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
