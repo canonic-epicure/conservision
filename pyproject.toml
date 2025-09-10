@@ -19,4 +19,7 @@ dependencies = [
     "ipywidgets>=8.1.7",
     "ipympl>=0.9.7",
     "notebook>=7.4.5",
+    "adamp>=0.3.0",
+    "tensorboard>=2.20.0",
 ]
+

@@ -12,7 +12,10 @@ wheels/
 # Virtual environments
 .venv
 
-/models
-/models_siglip2
+# data
 /data
 /submission*.csv
+
+# checkpoints
+/models
+/models_*

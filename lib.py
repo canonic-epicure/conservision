@@ -1,5 +1,6 @@
 import glob
 import re
+import math
 from pathlib import Path
 from typing import Tuple, List
 
@@ -222,10 +223,8 @@ class ImagesDatasetResnet(Dataset):
                 v2.RandomRotation(degrees=15, interpolation=InterpolationMode.BICUBIC) if learning else lambda x: x,
 
                 v2.Resize((224, 224), interpolation=InterpolationMode.BICUBIC),
-                v2.ToDtype(torch.float32, scale=True)(),
-                v2.Normalize(
-                    mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)
-                ),
+                v2.ToDtype(torch.float32, scale=True),
+                v2.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ]
         )
 
@@ -255,10 +254,18 @@ siglip2_training_transform = v2.Compose(
 
         v2.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.05),
         v2.RandomAutocontrast(p=0.1),
+        v2.RandomZoomOut(p=0.1),
         v2.RandomEqualize(p=0.1),
         v2.RandomAdjustSharpness(p=0.3, sharpness_factor=1.5),
         v2.RandomHorizontalFlip(p=0.5),
         v2.RandomRotation(degrees=15, interpolation=InterpolationMode.BICUBIC),
+    ]
+)
+siglip2_inference_transform = v2.Compose(
+    [
+        LabCLAHE(),
+        LabCLAHE(),
+        v2.ToPILImage(),
     ]
 )
 
@@ -277,6 +284,8 @@ class ImageDatasetSigLip2(Dataset):
 
         if self.learning:
             img = siglip2_training_transform(img)
+        else:
+            img = siglip2_inference_transform(img)
 
         # enc["pixel_values"]: (1, C, H, W) -> уберём размерность 0
         enc = self.processor(images=img, return_tensors="pt")
@@ -394,28 +403,45 @@ def predict_siglip_ten_crop(model, data_loader: DataLoader, T=1, desc='Predictin
     return pd.concat(preds_collector)
 
 
-# import math, torch
-# import torch.nn.functional as F
-# from torchvision import transforms
-# from PIL import Image
+def sce_loss(logits, target, alpha=0.1, beta=1.0, num_classes=None, eps=1e-4):
+    ce = F.cross_entropy(logits, target, reduction='none')  # [N]
+
+    # one-hot с клампом (можно подать сюда и mixup-таргеты [N,C] без клампа)
+    if num_classes is None:
+        num_classes = logits.size(1)
+
+    target = target.clamp_min(eps)  # [N,C]
+
+    p = F.softmax(logits, dim=1)
+    rce = -(p * target.log()).sum(dim=1)  # [N]
+
+    loss = alpha * ce + beta * rce
+    return loss.mean()
+
+
+# # Утилита: делаем функцию-множитель для LambdaLR
+# def make_cosine_multiplier(total_steps, warmup_steps, floor_ratio):
+#     """
+#     total_steps: на сколько шагов растянуть спад; после этого держим floor.
+#     warmup_steps: сколько шагов линейно разогревать от 0 до 1.
+#     floor_ratio: доля от базового LR, ниже которой не падаем (например, 0.1 = 10%).
+#     Возвращает f(step_index) -> scale в [floor_ratio, 1.0].
+#     """
+#     total_steps = max(1, int(total_steps))
+#     warmup_steps = max(0, int(warmup_steps))
+#     floor_ratio = float(floor_ratio)
 #
-# v2.TenCrop(size=)
-#
-# # 1) TTA-трансформа: Resize→FiveCrop(384) + hflip для каждого кропа
-# resize_448 = transforms.Resize(448, antialias=True)
-# fivecrop   = transforms.FiveCrop(384)
-#
-# def make_tta_views(img: Image.Image):
-#     crops = list(fivecrop(img))                  # 5 PIL-изображений
-#     flips = [transforms.functional.hflip(c) for c in crops]
-#     return crops + flips                         # всего M=10
-#
-# # 2) Прогоняем через processor→model и агрегируем лог-вероятности
-# @torch.no_grad()
-# def tta_logprob_mean(model, processor, img: Image.Image, device="cuda"):
-#     views = make_tta_views(img)                                  # M PIL
-#     enc = processor(images=views, return_tensors="pt")           # батч M
-#     logits = model(enc["pixel_values"].to(device)).logits        # (M, K)
-#     logp = F.log_softmax(logits, dim=1)                          # (M, K)
-#     logp_mean = torch.logsumexp(logp, dim=0) - math.log(len(views))  # (K,)
-#     return logp_mean  # агрегированные лог-вероятности по классам
+#     def f(step):
+#         # В WARNING: в PyTorch первый scheduler.step() делает last_epoch=0.
+#         # Поэтому step здесь – это last_epoch от LambdaLR.
+#         if step < warmup_steps:
+#             # линейный разогрев: 0 -> 1 (но не больше 1)
+#             return (step + 1) / max(1, warmup_steps)
+#         # прогресс внутри "косинусной" части [0..1]
+#         t = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+#         if t >= 1.0:
+#             # вышли за горизонт: держим пол
+#             return floor_ratio
+#         # косинусный спад из [1..floor_ratio]
+#         return floor_ratio + (1.0 - floor_ratio) * 0.5 * (1.0 + math.cos(math.pi * t))
+#     return f
