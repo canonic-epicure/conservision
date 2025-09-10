@@ -18,6 +18,8 @@ from transformers import AutoImageProcessor, AutoModelForImageClassification
 import dividemix_dataloader as dataloader
 
 import data
+import lib
+from src.util_siglip import set_freezing
 
 parser = argparse.ArgumentParser(description='DivideMix training')
 parser.add_argument('--checkpoint_dir', default='dividemix_checkpoints', type=str, help='directory for checkpoints')
@@ -63,10 +65,10 @@ def train(epoch, net1, net2, optimizer, labeled_trainloader, unlabeled_trainload
 
         with torch.no_grad():
             # label co-guessing of unlabeled samples
-            outputs_u11 = net1(inputs_unlab_1)
-            outputs_u12 = net1(inputs_unlab_2)
-            outputs_u21 = net2(inputs_unlab_1)
-            outputs_u22 = net2(inputs_unlab_2)
+            outputs_u11 = net1(inputs_unlab_1).logits
+            outputs_u12 = net1(inputs_unlab_2).logits
+            outputs_u21 = net2(inputs_unlab_1).logits
+            outputs_u22 = net2(inputs_unlab_2).logits
 
             pu = (torch.softmax(outputs_u11, dim=1) + torch.softmax(outputs_u12, dim=1)
                   + torch.softmax(outputs_u21, dim=1) + torch.softmax(outputs_u22, dim=1)) / 4
@@ -76,8 +78,8 @@ def train(epoch, net1, net2, optimizer, labeled_trainloader, unlabeled_trainload
             targets_u = targets_u.detach()
 
             # label refinement of labeled samples
-            outputs_x1 = net1(inputs_lab_1)
-            outputs_x2 = net1(inputs_lab_2)
+            outputs_x1 = net1(inputs_lab_1).logits
+            outputs_x2 = net1(inputs_lab_2).logits
 
             px = (torch.softmax(outputs_x1, dim=1) + torch.softmax(outputs_x2, dim=1)) / 2
             px = probs_x * labels_x + (1 - probs_x) * px
@@ -101,7 +103,7 @@ def train(epoch, net1, net2, optimizer, labeled_trainloader, unlabeled_trainload
         mixed_input = l * input_a[:batch_size * 2] + (1 - l) * input_b[:batch_size * 2]
         mixed_target = l * target_a[:batch_size * 2] + (1 - l) * target_b[:batch_size * 2]
 
-        logits = net1(mixed_input)
+        logits = net1(mixed_input).logits
 
         Lx = -torch.mean(torch.sum(F.log_softmax(logits, dim=1) * mixed_target, dim=1))
 
@@ -130,7 +132,7 @@ def warmup(net, optimizer, dataloader):
         images, labels = images.cuda(), labels.cuda()
         optimizer.zero_grad()
 
-        outputs = net(images)
+        outputs = net(images).logits
 
         loss = CEloss(outputs, labels)
         penalty = conf_penalty(outputs)
@@ -153,7 +155,7 @@ def val(net, val_loader, k):
     with torch.no_grad():
         for batch_idx, (images, targets, ids) in enumerate(val_loader):
             images, targets = images.cuda(), targets.cuda()
-            outputs = net(images)
+            outputs = net(images).logits
 
             _, target_idx = torch.max(targets, dim=1)
             _, predicted = torch.max(outputs, dim=1)
@@ -162,7 +164,7 @@ def val(net, val_loader, k):
             correct += predicted.eq(target_idx).cpu().sum().item()
     acc = 100. * correct / total
 
-    print("\n| Validation\t Net%d  Acc: %.2f%%" % (k, acc))
+    # print("\n| Validation\t Net%d  Acc: %.2f%%" % (k, acc))
     # if acc > best_acc[k - 1]:
     #     best_acc[k - 1] = acc
     #     print('| Saving Best Net%d ...' % k)
@@ -180,8 +182,8 @@ def test(net1, net2, test_loader):
         for batch_idx, (inputs, targets, ids) in enumerate(test_loader):
             inputs, targets = inputs.cuda(), targets.cuda()
 
-            outputs1 = net1(inputs)
-            outputs2 = net2(inputs)
+            outputs1 = net1(inputs).logits
+            outputs2 = net2(inputs).logits
             outputs = outputs1 + outputs2
 
             _, target_idx = torch.max(targets, dim=1)
@@ -203,7 +205,7 @@ def eval_train(epoch, model, eval_loader: DataLoader):
     with torch.no_grad():
         for batch_idx, (inputs, targets, ids_) in enumerate(eval_loader):
             inputs, targets = inputs.cuda(), targets.cuda()
-            outputs = model(inputs)
+            outputs = model(inputs).logits
             loss = CE(outputs, targets)
 
             losses[n:n + loss.size(0)] = loss.detach().cpu()
@@ -243,6 +245,7 @@ def create_model_siglip2_base_256(num_labels):
     model = AutoModelForImageClassification.from_pretrained(
         model_id,
         num_labels=num_labels,
+
         ignore_mismatched_sizes=True,  # создаст новую голову нужного размера
     )
 
@@ -265,6 +268,19 @@ def create_model_resnet_50(num_labels):
     return model
 
 
+print('| Building net')
+# net1 = create_model_resnet_50(args.num_class)
+# net2 = create_model_resnet_50(args.num_class)
+
+net1, preprocessor1 = create_model_siglip2_base_256(args.num_class)
+net2, preprocessor2 = create_model_siglip2_base_256(args.num_class)
+
+# optimizer1 = optim.SGD(net1.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-3)
+# optimizer2 = optim.SGD(net2.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-3)
+
+optimizer1 = optim.AdamW(net1.parameters(), lr=args.lr, weight_decay=1e-3)
+optimizer2 = optim.AdamW(net2.parameters(), lr=args.lr, weight_decay=1e-3)
+
 loader = dataloader.DividemixDataloaderFactory(
     data_dir=Path(__file__).parent / 'data',
     batch_size=args.batch_size,
@@ -273,35 +289,32 @@ loader = dataloader.DividemixDataloaderFactory(
     y_train=data.y_train,
     x_eval=data.x_eval,
     y_eval=data.y_eval,
+    preprocessor=lambda image: preprocessor1(images=image, return_tensors="pt")['pixel_values'].squeeze(0),
+    aug_train=lib.siglip2_training_transform,
+    aug_inference=lib.siglip2_inference_transform,
 )
 
-print('| Building net')
-# net1 = create_model_resnet_50(args.num_class)
-# net2 = create_model_resnet_50(args.num_class)
-
-net1 = create_model_siglip2_base_256(args.num_class)
-net2 = create_model_siglip2_base_256(args.num_class)
-
-# optimizer1 = optim.SGD(net1.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-3)
-# optimizer2 = optim.SGD(net2.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-3)
-
-optimizer1 = optim.AdamW(net1.parameters(), lr=args.lr, weight_decay=1e-3)
-optimizer2 = optim.AdamW(net2.parameters(), lr=args.lr, weight_decay=1e-3)
+warmup_epochs = 7
 
 CE = nn.CrossEntropyLoss(reduction='none')
 CEloss = nn.CrossEntropyLoss()
 conf_penalty = NegEntropy()
 
 for epoch in range(args.num_epochs + 1):
-    lr = args.lr
-    if epoch >= 40:
-        lr /= 10
-    for param_group in optimizer1.param_groups:
-        param_group['lr'] = lr
-    for param_group in optimizer2.param_groups:
-        param_group['lr'] = lr
+    print(f"Starting epoch { epoch }")
 
-    if epoch < 1:  # warm up
+    lr = args.lr
+    # if epoch >= 40:
+    #     lr /= 10
+    # for param_group in optimizer1.param_groups:
+    #     param_group['lr'] = lr
+    # for param_group in optimizer2.param_groups:
+    #     param_group['lr'] = lr
+
+    if epoch < warmup_epochs:  # warm up
+        set_freezing(net1, optimizer1, 'classifier_only')
+        set_freezing(net2, optimizer2, 'classifier_only')
+
         print('Warmup Net1')
         train_loader = loader.get_warmup_dataloader()
         warmup(net1, optimizer1, train_loader)
@@ -310,6 +323,9 @@ for epoch in range(args.num_epochs + 1):
         train_loader = loader.get_warmup_dataloader()
         warmup(net2, optimizer2, train_loader)
     else:
+        set_freezing(net1, optimizer1, 'classifier_and_encoder')
+        set_freezing(net2, optimizer2, 'classifier_and_encoder')
+
         pred1 = prob1 > args.p_threshold  # divide dataset
         pred2 = prob2 > args.p_threshold
 
@@ -321,19 +337,23 @@ for epoch in range(args.num_epochs + 1):
         labeled_trainloader, unlabeled_trainloader = loader.get_train_dataloader(ids1, prob1, pred1)  # co-divide
         train(epoch, net2, net1, optimizer2, labeled_trainloader, unlabeled_trainloader)  # train net2
 
-    val_loader = loader.get_validation_dataloader()  # validation
-    acc1 = val(net1, val_loader, 1)
-    acc2 = val(net2, val_loader, 2)
+    if epoch >= warmup_epochs - 1:
+        val_loader = loader.get_validation_dataloader()  # validation
+        acc1 = val(net1, val_loader, 1)
+        acc2 = val(net2, val_loader, 2)
 
-    print(f'Validation Epoch:{ epoch }      Acc1: {acc1:.2f}  Acc2:{acc2:.2f}')
+        print(f'Validation Epoch:{ epoch }      Acc1: {acc1:.2f}  Acc2:{acc2:.2f}')
 
-    print('\n==== net 1 evaluate next epoch training data loss ====')
-    eval_loader = loader.get_eval_train_dataloader()  # evaluate training data loss for next epoch
-    prob1, ids1 = eval_train(epoch, net1, eval_loader)
+        print('==== net 1 evaluate next epoch training data loss ====')
+        eval_loader = loader.get_eval_train_dataloader()  # evaluate training data loss for next epoch
+        prob1, ids1 = eval_train(epoch, net1, eval_loader)
 
-    print('\n==== net 2 evaluate next epoch training data loss ====')
-    eval_loader = loader.get_eval_train_dataloader()
-    prob2, ids2 = eval_train(epoch, net2, eval_loader)
+        print('==== net 2 evaluate next epoch training data loss ====')
+        eval_loader = loader.get_eval_train_dataloader()
+        prob2, ids2 = eval_train(epoch, net2, eval_loader)
+
+    lib.save_model(net1, optimizer1, f'./dividemix_checkpoint/net1_{str(epoch).rjust(3, "0")}.pth')
+    lib.save_model(net2, optimizer2, f'./dividemix_checkpoint/net2_{str(epoch).rjust(3, "0")}.pth')
 
 test_loader = loader.get_test_dataloader()
 acc = test(net1, net2, test_loader)

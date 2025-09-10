@@ -71,25 +71,29 @@ class DivideMixUnlabeledDataset(ImageDataset):
 random_state = 42
 
 class DividemixDataloaderFactory():
-    def __init__(self, data_dir, batch_size, num_workers, x_train, y_train, x_eval, y_eval):
+    def __init__(self, data_dir, batch_size, num_workers, x_train, y_train, x_eval, y_eval, preprocessor, aug_train, aug_inference):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.data_dir = data_dir
 
-        self.x_train = data.x_train
-        self.y_train = data.y_train
-        self.x_eval = data.x_eval
-        self.y_eval = data.y_eval
+        self.preprocessor = preprocessor
+        self.aug_train = aug_train
+        self.aug_inference = aug_inference
+
+        self.x_train = x_train
+        self.y_train = y_train
+        self.x_eval = x_eval
+        self.y_eval = y_eval
 
     def get_eval_train_dataloader(self) -> DataLoader:
-        data_ = self.x_train.sample(frac=0.01, random_state=random_state)
+        data_ = self.x_train #.sample(frac=0.01, random_state=random_state)
         labels_ = self.y_train.loc[ data_.index ]
 
         return DataLoader(
             dataset=ImageDatasetWithLabel(
                 data_dir=self.data_dir,
                 data=data_, labels=labels_,
-                processor=transformations.resnet50_process, aug=transformations.resnet50_transform_inference
+                processor=self.preprocessor, aug=transformations.resnet50_transform_inference
             ),
             batch_size=self.batch_size * 2,
             shuffle=False,
@@ -97,14 +101,14 @@ class DividemixDataloaderFactory():
         )
 
     def get_warmup_dataloader(self) -> DataLoader:
-        data_ = self.x_train.sample(frac=0.01, random_state=random_state)
+        data_ = self.x_train #.sample(frac=0.01, random_state=random_state)
         labels_ = self.y_train.loc[ data_.index ]
 
         return DataLoader(
             dataset=ImageDatasetWithLabel(
                 data_dir=self.data_dir,
                 data=data_, labels=labels_,
-                processor=transformations.resnet50_process, aug=transformations.resnet50_transform_train
+                processor=self.preprocessor, aug=transformations.resnet50_transform_train
             ),
             batch_size=self.batch_size * 2,
             shuffle=True,
@@ -112,14 +116,14 @@ class DividemixDataloaderFactory():
         )
 
     def get_validation_dataloader(self) -> DataLoader:
-        data_ = self.x_eval.sample(frac=0.01, random_state=random_state)
+        data_ = self.x_eval #.sample(frac=0.01, random_state=random_state)
         labels_ = self.y_eval.loc[ data_.index ]
 
         return DataLoader(
             dataset=ImageDatasetWithLabel(
                 data_dir=self.data_dir,
                 data=data_, labels=labels_,
-                processor=transformations.resnet50_process, aug=transformations.resnet50_transform_inference
+                processor=self.preprocessor, aug=transformations.resnet50_transform_inference
             ),
             batch_size=self.batch_size * 2,
             shuffle=False,
@@ -128,14 +132,14 @@ class DividemixDataloaderFactory():
 
     # same as validation for now
     def get_test_dataloader(self) -> DataLoader:
-        data_ = self.x_eval.sample(frac=0.01, random_state=random_state)
+        data_ = self.x_eval #.sample(frac=0.01, random_state=random_state)
         labels_ = self.y_eval.loc[ data_.index ]
 
         return DataLoader(
             dataset=ImageDatasetWithLabel(
                 data_dir=self.data_dir,
                 data=data_, labels=labels_,
-                processor=transformations.resnet50_process, aug=transformations.resnet50_transform_inference
+                processor=self.preprocessor, aug=transformations.resnet50_transform_inference
             ),
             batch_size=self.batch_size * 2,
             shuffle=False,
@@ -147,7 +151,7 @@ class DividemixDataloaderFactory():
 
         labeled_dataset = DivideMixLabeledDataset(
             data_dir=self.data_dir,
-            processor=transformations.resnet50_process, aug=transformations.resnet50_transform_train,
+            processor=self.preprocessor, aug=transformations.resnet50_transform_train,
             data=self.x_train.loc[labeled_ids], labels=self.y_train.loc[labeled_ids], probs=probs[mask],
         )
         labeled_loader = DataLoader(
@@ -160,7 +164,7 @@ class DividemixDataloaderFactory():
         unlabeled_ids = np.array(ids)[~mask]
         unlabeled_dataset = DivideMixUnlabeledDataset(
             data_dir=self.data_dir,
-            processor=transformations.resnet50_process, aug=transformations.resnet50_transform_train,
+            processor=self.preprocessor, aug=transformations.resnet50_transform_train,
             data=self.x_train.loc[unlabeled_ids]
         )
         unlabeled_loader = DataLoader(

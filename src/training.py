@@ -1,20 +1,24 @@
-# import pandas as pd
-# import torch
-# import numpy as np
-# from PIL import Image
-# from torch.utils.data import Dataset, DataLoader
-#
-# import data
-# import transformations
-#
-#
-# class Training():
-#     def __init__(self, *args, model, **kwargs):
-#         self.labels = labels
-#         super().__init__(*args, **kwargs)
-#
-#     def get_labels(self, idx):
-#         return torch.tensor(self.labels.iloc[idx].values).float()
+from typing import Union, List
+
+import pandas as pd
+import torch
+import numpy as np
+from PIL import Image
+from torch.utils.data import Dataset, DataLoader
+
+import data
+import transformations
+
+
+class Training():
+    epoch: int
+
+    loss: List[float]
+
+    def __init__(self, *args, model, epoch=0, **kwargs):
+        self.epoch = epoch
+        super().__init__(*args, **kwargs)
+
 #
 #
 # class ImageDataset(Dataset):

@@ -3,7 +3,12 @@ from typing import Literal
 from transformers import Siglip2Model
 
 
-def freeze(model: Siglip2Model, unfreezing: Literal['classifier_only', 'classifier_and_encoder'] = 'classifier_and_encoder', L: int = 4):
+def set_freezing(
+    model: Siglip2Model,
+    optimizer,
+    mode: Literal['classifier_only', 'classifier_and_encoder'] = 'classifier_and_encoder',
+    L: int = 4
+):
     # A) Сначала всё заморозим
     for p in model.parameters():
         p.requires_grad = False
@@ -11,7 +16,7 @@ def freeze(model: Siglip2Model, unfreezing: Literal['classifier_only', 'classifi
     head_params = []
     enc_params  = []
 
-    if unfreezing == 'classifier_only' or unfreezing == 'classifier_and_encoder':
+    if mode == 'classifier_only' or mode == 'classifier_and_encoder':
         # unfreeze classifier if needed
         for name, p in model.named_parameters():
             if "classifier" in name:
@@ -19,7 +24,7 @@ def freeze(model: Siglip2Model, unfreezing: Literal['classifier_only', 'classifi
                 head_params.append(p)
 
     # unfreeze encoder if needed
-    if unfreezing == 'classifier_and_encoder':
+    if mode == 'classifier_and_encoder':
         # B) Разморозим последние L блоков визуального энкодера
         layers = model.vision_model.encoder.layers   # ModuleList
         for block in layers[-L:]:
@@ -27,4 +32,7 @@ def freeze(model: Siglip2Model, unfreezing: Literal['classifier_only', 'classifi
                 p.requires_grad = True
                 enc_params.append(p)
 
-    return head_params, enc_params
+    optimizer.param_groups = []
+
+    optimizer.add_param_group({'name': "classifier", "params": head_params, "lr": 1e-3, "weight_decay": 0.01})
+    optimizer.add_param_group({'name': "encoder", "params": enc_params, "lr": 1e-4, "weight_decay": 0.01})
