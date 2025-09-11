@@ -1,6 +1,7 @@
 import argparse
 import random
-import sys
+import signal
+import threading
 from pathlib import Path
 
 import numpy as np
@@ -12,15 +13,26 @@ import torchvision.models as models
 import tqdm
 from sklearn.mixture import GaussianMixture
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
 from torchvision.models import ResNet50_Weights
 from transformers import AutoImageProcessor, AutoModelForImageClassification
 
-import dividemix_dataloader as dataloader
-
 import data
+import dividemix_dataloader as dataloader
 import lib
 import src.training
 from src.util_siglip import set_freezing
+
+writer = SummaryWriter()
+
+
+stop = threading.Event()
+
+def handle_signal(signum, frame):
+    stop.set()
+
+signal.signal(signal.SIGTERM, handle_signal)
+signal.signal(signal.SIGINT,  handle_signal)
 
 parser = argparse.ArgumentParser(description='DivideMix training')
 parser.add_argument('--checkpoint_dir', default='dividemix_checkpoints', type=str, help='directory for checkpoints')
@@ -264,7 +276,9 @@ def create_model_siglip2_base_256(num_labels):
 
 
 def create_model_resnet_50(num_labels):
-    model = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+    model = models.convnext_large
+
+    resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
     model.fc = nn.Linear(2048, num_labels)
     model = model.cuda()
     return model
@@ -331,6 +345,9 @@ prob1 = None
 prob2 = None
 
 for epoch in range(epoch, epoch + args.num_epochs):
+    if stop.is_set():
+        break
+
     print(f"Starting epoch { epoch }")
 
     # lr = args.lr
@@ -390,3 +407,5 @@ test_loader = loader.get_test_dataloader()
 acc = test(net1, net2, test_loader)
 
 print('Test Accuracy:%.2f\n' % (acc))
+
+writer.close()
