@@ -19,6 +19,7 @@ import dividemix_dataloader as dataloader
 
 import data
 import lib
+import src.training
 from src.util_siglip import set_freezing
 
 parser = argparse.ArgumentParser(description='DivideMix training')
@@ -48,7 +49,8 @@ def train(epoch, net1, net2, optimizer, labeled_trainloader, unlabeled_trainload
 
     unlabeled_train_iter = iter(unlabeled_trainloader)
     num_iter = (len(labeled_trainloader.dataset) // args.batch_size) + 1
-    for batch_idx, (inputs_lab_1, inputs_lab_2, labels_x, probs_x, ids) in enumerate(labeled_trainloader):
+
+    for batch_idx, (inputs_lab_1, inputs_lab_2, labels_x, probs_x, ids) in tqdm.tqdm(enumerate(labeled_trainloader), total=len(labeled_trainloader), desc="Training"):
         try:
             inputs_unlab_1, inputs_unlab_2, id = next(unlabeled_train_iter)
         except:
@@ -88,7 +90,7 @@ def train(epoch, net1, net2, optimizer, labeled_trainloader, unlabeled_trainload
             targets_x = ptx / ptx.sum(dim=1, keepdim=True)  # normalize
             targets_x = targets_x.detach()
 
-            # mixmatch
+        # mixmatch
         l = np.random.beta(args.alpha, args.alpha)
         l = max(l, 1 - l)
 
@@ -153,7 +155,7 @@ def val(net, val_loader, k):
     correct = 0
     total = 0
     with torch.no_grad():
-        for batch_idx, (images, targets, ids) in enumerate(val_loader):
+        for batch_idx, (images, targets, ids) in tqdm.tqdm(enumerate(val_loader), total=len(val_loader), desc="Validation"):
             images, targets = images.cuda(), targets.cuda()
             outputs = net(images).logits
 
@@ -179,7 +181,7 @@ def test(net1, net2, test_loader):
     correct = 0
     total = 0
     with torch.no_grad():
-        for batch_idx, (inputs, targets, ids) in enumerate(test_loader):
+        for batch_idx, (inputs, targets, ids) in tqdm.tqdm(enumerate(test_loader), total=len(test_loader), desc="Testing"):
             inputs, targets = inputs.cuda(), targets.cuda()
 
             outputs1 = net1(inputs).logits
@@ -203,7 +205,7 @@ def eval_train(epoch, model, eval_loader: DataLoader):
     ids = []
     n = 0
     with torch.no_grad():
-        for batch_idx, (inputs, targets, ids_) in enumerate(eval_loader):
+        for batch_idx, (inputs, targets, ids_) in tqdm.tqdm(enumerate(eval_loader), total=len(eval_loader), desc="Eval-training"):
             inputs, targets = inputs.cuda(), targets.cuda()
             outputs = model(inputs).logits
             loss = CE(outputs, targets)
@@ -272,14 +274,39 @@ print('| Building net')
 # net1 = create_model_resnet_50(args.num_class)
 # net2 = create_model_resnet_50(args.num_class)
 
-net1, preprocessor1 = create_model_siglip2_base_256(args.num_class)
-net2, preprocessor2 = create_model_siglip2_base_256(args.num_class)
+storage = src.training.CheckpointsStorage(dir=Path('dividemix_checkpoint'))
 
-# optimizer1 = optim.SGD(net1.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-3)
-# optimizer2 = optim.SGD(net2.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-3)
+latest1, epoch1 = storage.latest(r'net1_(\d+)\.pth')
+latest2, epoch2 = storage.latest(r'net2_(\d+)\.pth')
 
-optimizer1 = optim.AdamW(net1.parameters(), lr=args.lr, weight_decay=1e-3)
-optimizer2 = optim.AdamW(net2.parameters(), lr=args.lr, weight_decay=1e-3)
+if epoch1 != epoch2:
+    raise ValueError('Checkpoints of models out of sync.')
+
+epoch = 0
+
+if latest1 and latest2:
+    checkpoint1 = torch.load(latest1, weights_only=False)
+    checkpoint2 = torch.load(latest2, weights_only=False)
+
+    epoch = epoch1 + 1
+
+    net1 = checkpoint1['model']
+    net2 = checkpoint2['model']
+
+    optimizer1 = checkpoint1['optimizer']
+    optimizer2 = checkpoint2['optimizer']
+
+    preprocessor1 = AutoImageProcessor.from_pretrained(net1.name_or_path)
+    preprocessor2 = AutoImageProcessor.from_pretrained(net2.name_or_path)
+else:
+    net1, preprocessor1 = create_model_siglip2_base_256(args.num_class)
+    net2, preprocessor2 = create_model_siglip2_base_256(args.num_class)
+
+    # optimizer1 = optim.SGD(net1.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-3)
+    # optimizer2 = optim.SGD(net2.parameters(), lr=args.lr, momentum=0.9, weight_decay=1e-3)
+
+    optimizer1 = optim.AdamW(net1.parameters(), lr=args.lr, weight_decay=1e-3)
+    optimizer2 = optim.AdamW(net2.parameters(), lr=args.lr, weight_decay=1e-3)
 
 loader = dataloader.DividemixDataloaderFactory(
     data_dir=Path(__file__).parent / 'data',
@@ -294,16 +321,19 @@ loader = dataloader.DividemixDataloaderFactory(
     aug_inference=lib.siglip2_inference_transform,
 )
 
-warmup_epochs = 7
+warmup_epochs = 5
 
 CE = nn.CrossEntropyLoss(reduction='none')
 CEloss = nn.CrossEntropyLoss()
 conf_penalty = NegEntropy()
 
-for epoch in range(args.num_epochs + 1):
+prob1 = None
+prob2 = None
+
+for epoch in range(epoch, epoch + args.num_epochs):
     print(f"Starting epoch { epoch }")
 
-    lr = args.lr
+    # lr = args.lr
     # if epoch >= 40:
     #     lr /= 10
     # for param_group in optimizer1.param_groups:
@@ -323,19 +353,20 @@ for epoch in range(args.num_epochs + 1):
         train_loader = loader.get_warmup_dataloader()
         warmup(net2, optimizer2, train_loader)
     else:
-        set_freezing(net1, optimizer1, 'classifier_and_encoder')
-        set_freezing(net2, optimizer2, 'classifier_and_encoder')
+        if prob1 is not None and prob2 is not None:
+            set_freezing(net1, optimizer1, 'classifier_and_encoder')
+            set_freezing(net2, optimizer2, 'classifier_and_encoder')
 
-        pred1 = prob1 > args.p_threshold  # divide dataset
-        pred2 = prob2 > args.p_threshold
+            pred1 = prob1 > args.p_threshold  # divide dataset
+            pred2 = prob2 > args.p_threshold
 
-        print('Train Net1')
-        labeled_trainloader, unlabeled_trainloader = loader.get_train_dataloader(ids2, prob2, pred2)  # co-divide
-        train(epoch, net1, net2, optimizer1, labeled_trainloader, unlabeled_trainloader)  # train net1
+            print('Train Net1')
+            labeled_trainloader, unlabeled_trainloader = loader.get_train_dataloader(ids2, prob2, pred2)  # co-divide
+            train(epoch, net1, net2, optimizer1, labeled_trainloader, unlabeled_trainloader)  # train net1
 
-        print('Train Net2')
-        labeled_trainloader, unlabeled_trainloader = loader.get_train_dataloader(ids1, prob1, pred1)  # co-divide
-        train(epoch, net2, net1, optimizer2, labeled_trainloader, unlabeled_trainloader)  # train net2
+            print('Train Net2')
+            labeled_trainloader, unlabeled_trainloader = loader.get_train_dataloader(ids1, prob1, pred1)  # co-divide
+            train(epoch, net2, net1, optimizer2, labeled_trainloader, unlabeled_trainloader)  # train net2
 
     if epoch >= warmup_epochs - 1:
         val_loader = loader.get_validation_dataloader()  # validation
