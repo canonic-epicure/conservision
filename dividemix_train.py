@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -187,7 +188,38 @@ def val(net, val_loader, k):
     return acc
 
 
-def test(net1, net2, test_loader):
+def predict(net1, net2, predict_loader, T=1, columns=None):
+    preds_collector = []
+
+    net1.eval()
+    net2.eval()
+
+    with torch.no_grad():
+        for batch_idx, (inputs, ids) in tqdm.tqdm(enumerate(predict_loader), total=len(predict_loader), desc="Predicting"):
+            inputs = inputs.cuda()
+
+            outputs1 = net1(inputs).logits
+            outputs2 = net2(inputs).logits
+            outputs = outputs1 + outputs2
+
+            _, predicted = torch.max(outputs, 1)
+
+            preds = F.softmax(outputs / T, dim=1)
+            # 3) store this batch's predictions in df
+            # note that PyTorch Tensors need to first be detached from their computational graph before converting to numpy arrays
+            preds_df = pd.DataFrame(
+                preds.detach().to('cpu').numpy(),
+                index=ids,
+                columns=columns,
+            )
+            preds_collector.append(preds_df)
+
+    return pd.concat(preds_collector)
+
+
+def test(net1, net2, test_loader, T=1, columns=None):
+    preds_collector = []
+
     net1.eval()
     net2.eval()
     correct = 0
@@ -205,9 +237,20 @@ def test(net1, net2, test_loader):
 
             total += targets.size(0)
             correct += predicted.eq(target_idx).cpu().sum().item()
+
+            preds = F.softmax(outputs / T, dim=1)
+            # 3) store this batch's predictions in df
+            # note that PyTorch Tensors need to first be detached from their computational graph before converting to numpy arrays
+            preds_df = pd.DataFrame(
+                preds.detach().to('cpu').numpy(),
+                index=ids,
+                columns=columns,
+            )
+            preds_collector.append(preds_df)
+
     acc = 100. * correct / total
     print("\n| Test Acc: %.2f%%\n" % (acc))
-    return acc
+    return acc, pd.concat(preds_collector)
 
 
 def eval_train(epoch, model, eval_loader: DataLoader):
@@ -254,7 +297,7 @@ class NegEntropy(object):
 
 
 def create_model_siglip2_base_256(num_labels):
-    model_id = "google/siglip2-base-patch16-256"  # FixRes вариант
+    model_id = "google/siglip2-large-patch16-384"  # FixRes вариант
 
     model = AutoModelForImageClassification.from_pretrained(
         model_id,
@@ -276,9 +319,7 @@ def create_model_siglip2_base_256(num_labels):
 
 
 def create_model_resnet_50(num_labels):
-    model = models.convnext_large
-
-    resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
+    model = models.resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
     model.fc = nn.Linear(2048, num_labels)
     model = model.cuda()
     return model
@@ -290,19 +331,19 @@ print('| Building net')
 
 storage = src.training.CheckpointsStorage(dir=Path('dividemix_checkpoint'))
 
-latest1, epoch1 = storage.latest(r'net1_(\d+)\.pth')
-latest2, epoch2 = storage.latest(r'net2_(\d+)\.pth')
+latest1 = storage.latest(r'net1_(\d+)\.pth')
+latest2 = storage.latest(r'net2_(\d+)\.pth')
 
-if epoch1 != epoch2:
+if latest1 and latest2 and latest1[1] != latest2[1]:
     raise ValueError('Checkpoints of models out of sync.')
 
 epoch = 0
 
 if latest1 and latest2:
-    checkpoint1 = torch.load(latest1, weights_only=False)
-    checkpoint2 = torch.load(latest2, weights_only=False)
+    checkpoint1 = torch.load(latest1[0], weights_only=False)
+    checkpoint2 = torch.load(latest2[0], weights_only=False)
 
-    epoch = epoch1 + 1
+    epoch = latest1[1] + 1
 
     net1 = checkpoint1['model']
     net2 = checkpoint2['model']
@@ -334,8 +375,8 @@ loader = dataloader.DividemixDataloaderFactory(
     aug_train=lib.siglip2_training_transform,
     aug_inference=lib.siglip2_inference_transform,
 )
+warmup_epochs = 1
 
-warmup_epochs = 5
 
 CE = nn.CrossEntropyLoss(reduction='none')
 CEloss = nn.CrossEntropyLoss()
@@ -366,9 +407,15 @@ for epoch in range(epoch, epoch + args.num_epochs):
         train_loader = loader.get_warmup_dataloader()
         warmup(net1, optimizer1, train_loader)
 
+        if stop.is_set():
+            break
+
         print('Warmup Net2')
         train_loader = loader.get_warmup_dataloader()
         warmup(net2, optimizer2, train_loader)
+
+        if stop.is_set():
+            break
     else:
         if prob1 is not None and prob2 is not None:
             set_freezing(net1, optimizer1, 'classifier_and_encoder')
@@ -404,8 +451,20 @@ for epoch in range(epoch, epoch + args.num_epochs):
     lib.save_model(net2, optimizer2, f'./dividemix_checkpoint/net2_{str(epoch).rjust(3, "0")}.pth')
 
 test_loader = loader.get_test_dataloader()
-acc = test(net1, net2, test_loader)
+acc, submission_df = test(net1, net2, test_loader, T=0.8, columns=data.species_labels)
 
 print('Test Accuracy:%.2f\n' % (acc))
 
+# test_loader = loader.get_predict_dataloader()
+# submission_df = predict(net1, net2, test_loader, T=0.8, columns=data.species_labels)
+
+# print('Test Accuracy:%.2f\n' % (acc))
+
 writer.close()
+
+# submission_format = pd.read_csv("data/submission_format.csv", index_col="id")
+#
+# assert all(submission_df.index == submission_format.index)
+# assert all(submission_df.columns == submission_format.columns)
+#
+# submission_df.to_csv("submission.csv")

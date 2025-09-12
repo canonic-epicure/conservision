@@ -1,4 +1,5 @@
 import pandas as pd
+from sklearn.model_selection import StratifiedGroupKFold
 
 import lib
 
@@ -19,10 +20,6 @@ train_features['resolution'] = train_features['filepath'].apply(lambda filename:
 
 train_features['site_plus_resolution'] = train_features['site'] + '_' + train_features['resolution']
 
-train_all = train_features.merge(train_labels, on='id')
-
-
-
 y = train_labels
 y_refined = train_labels_refined
 x = train_features.loc[y.index]
@@ -38,3 +35,14 @@ y_train_refined = y_refined[ ~mask_val ]
 x_eval = x[ mask_val ]
 y_eval = y[ mask_val ]
 y_eval_refined = y_refined[ mask_val ]
+
+train_labels['label'] = train_labels.to_numpy().argmax(axis=1)
+
+train_all = train_features.merge(train_labels[['label']], on='id')
+
+train_all['fold'] = -1
+
+splitter = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+
+for fold, (train_idx, val_idx) in enumerate(splitter.split(train_all, train_all['label'], groups=train_all['site'])):
+    train_all.iloc[val_idx, train_all.columns.get_loc('fold')] = fold
