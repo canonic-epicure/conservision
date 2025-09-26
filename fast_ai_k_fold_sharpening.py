@@ -6,6 +6,7 @@ print("RTX 5090 Training Mode Activated!")
 # Automatic dependency management
 import subprocess
 import sys
+import pickle
 
 def install_package(package):
     try:
@@ -75,7 +76,7 @@ class CFG:
     # Competition settings
     TARGET_COL = 'label'
     SEED = 42
-    BASE_LR = 1e-3 / 2
+    BASE_LR = 1e-3
 
 print(f"RTX 5090 Configuration:")
 print(f"   Model: {CFG.MODEL_ARCHITECTURE}")
@@ -136,7 +137,9 @@ train_labels_df = pd.read_csv(CFG.TRAIN_LABELS_PATH)
 test_features_df = pd.read_csv(CFG.TEST_FEATURES_PATH)
 
 # Process labels - convert one-hot to categorical
-train_labels_df['label'] = train_labels_df.iloc[:, 1:].idxmax(axis=1)
+# train_labels_df['label'] = train_labels_df.iloc[:, 1:].idxmax(axis=1)
+train_labels_df['label'] = train_labels_df.iloc[:, 1:].to_numpy().argmax(axis=1)
+
 df = train_features_df.merge(train_labels_df[['id', 'label']], on='id')
 
 # Create image paths
@@ -167,12 +170,21 @@ print(df.fold.value_counts())
 # Training loop
 print(f"\nStarting RTX 5090 Training - {CFG.N_FOLDS} Fold Cross Validation")
 
-all_preds = []
+val_oof_logits = []
+all_test_preds = []
 all_oof_preds = []
 fold_scores = []
+raw_refined_logits = []
+
+
 vocab = None
 
+T_OPTIM = 1.3095703523498126
+
+conf_levels = [0.9508, 0.7626, 0.9538, 0.6099, 0.6124, 0.8225, 0.8520, 0.9090]
+
 for fold in range(CFG.N_FOLDS):
+# for fold in range(1):
     print(f"\n{'='*50}")
     print(f"Fold {fold} - RTX 5090 Training")
     print(f"{'='*50}")
@@ -191,124 +203,111 @@ for fold in range(CFG.N_FOLDS):
         get_x=ColReader('image_path'),
         get_y=ColReader(CFG.TARGET_COL),
         splitter=get_splitter(fold),
-        item_tfms=[ Resize(CFG.IMAGE_SIZE, method=ResizeMethod.Pad, pad_mode=PadMode.Zeros) ],
+        item_tfms=Resize(CFG.IMAGE_SIZE, method=ResizeMethod.Pad, pad_mode=PadMode.Zeros),
         batch_tfms=[*get_transforms(), Normalize.from_stats(*imagenet_stats)]
     )
     
     print(f"Creating DataLoaders (batch size: {CFG.BATCH_SIZE})...")
     
-    try:
-        # Create DataLoaders with RTX 5090 optimizations
-        if torch.cuda.is_available():
-            dls = dblock.dataloaders(
-                df,
-                bs=CFG.BATCH_SIZE,
-                num_workers=CFG.NUM_WORKERS,
-                pin_memory=CFG.PIN_MEMORY,
-                prefetch_factor=CFG.PREFETCH_FACTOR
-            )
-        else:
-            dls = dblock.dataloaders(
-                df,
-                bs=16,
-                num_workers=4
-            )
-        
-        # Store vocabulary from first fold
-        if vocab is None:
-            vocab = dls.vocab
-            print(f"Class vocabulary: {list(vocab)}")
-
-        print(f"Creating {CFG.MODEL_ARCHITECTURE} model...")
-        
-        # Setup callbacks for training
-        cbs = [
-            EarlyStoppingCallback(monitor='valid_loss', patience=3),
-            SaveModelCallback(monitor='valid_loss', fname=f'best_model_fold_{fold}')
-        ]
-        
-        # Create learner with mixed precision
-        learn = vision_learner(
-            dls,
-            CFG.MODEL_ARCHITECTURE,
-            metrics=[error_rate, accuracy],
-            cbs=cbs
-        ).to_fp16()
-
-        print(f"Starting training for {CFG.EPOCHS} epochs...")
-        
-        # Find optimal learning rate
-        try:
-            lr_min, lr_steep = learn.lr_find()
-            print(f"Suggested learning rate: {lr_steep:.2e}")
-            final_lr = lr_steep
-        except Exception as e:
-            print("Using default learning rate", e)
-            final_lr = CFG.BASE_LR
-        
-        # Train the model
-        learn.fit_one_cycle(CFG.EPOCHS, lr_max=final_lr)
-        
-        # Record validation scores
-        val_results = learn.validate()
-        val_loss = float(val_results[0])
-        val_acc = float(val_results[2])  # accuracy is the 2nd metric
-        fold_scores.append({'fold': fold, 'val_loss': val_loss, 'val_acc': val_acc})
-        print(f"Fold {fold} validation results: Loss={val_loss:.4f}, Acc={val_acc:.4f}")
-
-        # Generate test predictions
-        print("Generating predictions...")
-        test_dl = dls.test_dl(test_features_df)
-        preds, _ = learn.get_preds(dl=test_dl)
-        all_preds.append(preds)
-        
-        # Get out-of-fold predictions
-        val_dl = dls.valid
-        oof_preds, _ = learn.get_preds(dl=val_dl)
-        all_oof_preds.append(oof_preds)
-
-        # Memory cleanup
-        print("Memory cleanup...")
-        del learn, dls, test_dl, val_dl
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            
-    except Exception as e:
-        print(f"Fold {fold} training error: {e}")
-        print("Trying with reduced configuration...")
-        
-        # Fallback configuration
-        dls = dblock.dataloaders(df, bs=16, num_workers=4)
-        if vocab is None:
-            vocab = dls.vocab
-            
-        learn = vision_learner(
-            dls,
-            CFG.MODEL_ARCHITECTURE,
-            metrics=[error_rate, accuracy],
-            cbs=[EarlyStoppingCallback(monitor='valid_loss', patience=3)]
+    # Create DataLoaders with RTX 5090 optimizations
+    if torch.cuda.is_available():
+        dls = dblock.dataloaders(
+            df,
+            bs=CFG.BATCH_SIZE,
+            num_workers=CFG.NUM_WORKERS,
+            pin_memory=CFG.PIN_MEMORY,
+            prefetch_factor=CFG.PREFETCH_FACTOR
         )
-        
-        learn.fit_one_cycle(CFG.EPOCHS, lr_max=CFG.BASE_LR)
-        
-        val_results = learn.validate()
-        val_loss = float(val_results[0])
-        val_acc = float(val_results[2])
-        fold_scores.append({'fold': fold, 'val_loss': val_loss, 'val_acc': val_acc})
-        
-        test_dl = dls.test_dl(test_features_df)
-        preds, _ = learn.get_preds(dl=test_dl)
-        all_preds.append(preds)
-        
-        val_dl = dls.valid
-        oof_preds, _ = learn.get_preds(dl=val_dl)
-        all_oof_preds.append(oof_preds)
-        
-        del learn, dls, test_dl, val_dl
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    else:
+        dls = dblock.dataloaders(
+            df,
+            bs=16,
+            num_workers=4
+        )
+
+    # Store vocabulary from first fold
+    if vocab is None:
+        vocab = dls.vocab
+        print(f"Class vocabulary: {list(vocab)}")
+
+    print(f"Creating {CFG.MODEL_ARCHITECTURE} model...")
+
+    # Setup callbacks for training
+    cbs = [
+        EarlyStoppingCallback(monitor='valid_loss', patience=3),
+        SaveModelCallback(monitor='valid_loss', fname=f'best_model_fold_{fold}')
+    ]
+
+    # Create learner with mixed precision
+    learn = vision_learner(
+        dls,
+        CFG.MODEL_ARCHITECTURE,
+        metrics=[error_rate, accuracy],
+        cbs=cbs
+    ).to_fp16()
+
+    learn.load(f'best_model_fold_{fold}', device='cuda')
+
+    # print(f"Starting training for {CFG.EPOCHS} epochs...")
+    #
+    # # Find optimal learning rate
+    # try:
+    #     lr_min, lr_steep = learn.lr_find()
+    #     print(f"Suggested learning rate: {lr_steep:.2e}")
+    #     final_lr = lr_steep
+    # except Exception as e:
+    #     print("Using default learning rate", e)
+    #     final_lr = CFG.BASE_LR
+    #
+    # # Train the model
+    # learn.fit_one_cycle(CFG.EPOCHS, lr_max=final_lr)
+
+    ts_df = learn.dls.valid_ds.items
+    ts_dl = learn.dls.test_dl(ts_df)
+    logits, _ = learn.get_preds(dl=ts_dl, act=lambda x: x)
+
+    val_oof_logits.append(logits)
+
+    import temperature_scaling as ts
+
+    targets = torch.tensor(ts_df['label'].to_numpy())
+    ce = F.cross_entropy(logits, targets)
+
+    t_optim, optim_loss = ts.fit_temperature_lbfgs(logits, targets)
+
+    # Record validation scores
+    # val_results = learn.validate()
+    val_loss = optim_loss
+    # val_loss = float(val_results[0])
+    # val_acc = float(val_results[2])  # accuracy is the 2nd metric
+
+    val_acc = F.softmax(logits, dim=1).argmax(dim=1).eq(targets).float().mean().item()
+
+    fold_scores.append({'fold': fold, 'val_loss': val_loss, 'val_acc': val_acc, 't_optim': t_optim})
+    print(f"Fold {fold} validation results: Loss={ce:.4f}, Optimized loss: {val_loss:.4f}, Optim temeprature={t_optim:.4f}, Acc={val_acc:.4f}")
+
+    # Generate test predictions
+    print("Generating predictions...")
+    ts_dl = learn.dls.test_dl(df)
+    logits, _ = learn.get_preds(dl=ts_dl, act=lambda x: x)
+
+    raw_refined_logits.append(logits)
+
+    # preds = F.softmax(preds / t_optim, dim=1)
+    #
+    # all_test_preds.append(preds)
+
+    # Get out-of-fold predictions
+    # val_dl = dls.valid
+    # oof_preds, _ = learn.get_preds(dl=val_dl)
+    # all_oof_preds.append(oof_preds)
+
+    # Memory cleanup
+    print("Memory cleanup...")
+    del learn, dls
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 print(f"\n{'='*50}")
 print("RTX 5090 Training Complete!")
@@ -327,33 +326,62 @@ print(f"\nAverage performance: Loss={avg_loss:.4f}, Acc={avg_acc:.4f}")
 print(f"\nExecuting ensemble strategy...")
 
 val_accs = [s['val_acc'] for s in fold_scores]
-weights = torch.softmax(torch.tensor(val_accs) * 5, dim=0)
-print(f"Fold weights: {[f'{w:.3f}' for w in weights.tolist()]}")
+val_loss = [s['val_loss'] for s in fold_scores]
 
-# Weighted ensemble predictions
-ensemble_preds = sum(w * pred for w, pred in zip(weights, all_preds))
+weights_acc = torch.softmax(torch.tensor(val_accs) * 5, dim=0)
+print(f"Fold weights by acc: {[f'{w:.3f}' for w in weights_acc.tolist()]}")
 
-# Create submission file
-print("\nCreating submission file...")
+# # Weighted ensemble predictions
+# ensemble_preds = sum(w * pred for w, pred in zip(weights_acc, all_test_preds))
+#
+# weights_loss = torch.softmax(1 / torch.tensor(val_loss) * 5, dim=0)
+# print(f"Fold weights by loss: {[f'{w:.3f}' for w in weights_loss.tolist()]}")
+#
+# # Weighted ensemble predictions
+# ensemble_preds_loss = sum(w * pred for w, pred in zip(weights_loss, all_test_preds))
 
-submission_df = pd.DataFrame(columns=['id'] + list(vocab))
-submission_df['id'] = test_features_df['id']
-submission_df[list(vocab)] = ensemble_preds.numpy()
+with open("fast_ai_k_fold_pre_refine_data.pkl", "wb") as f:
+    pickle.dump({
+        'val_oof_logits': val_oof_logits,
+        'fold_scores': fold_scores,
+        'raw_refined_logits': raw_refined_logits,
+        'weights_by_accuracy': weights_acc,
+    }, f)
 
-# Save submission
-submission_df.to_csv('submission_fast_ai_k_fold.csv', index=False)
 
-print(f"\n{'='*50}")
-print("RTX 5090 Submission File Created!")
-print(f"{'='*50}")
-print("=== Configuration Summary ===")
-print(f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
-print(f"Model: {CFG.MODEL_ARCHITECTURE}")
-print(f"Resolution: {CFG.IMAGE_SIZE}x{CFG.IMAGE_SIZE}")
-print(f"Batch Size: {CFG.BATCH_SIZE}")
-print(f"Total Training Epochs: {CFG.N_FOLDS * CFG.EPOCHS}")
-print(f"Average Validation Accuracy: {avg_acc:.4f}")
-print(f"Mixed Precision Training: {'Yes' if torch.cuda.is_available() else 'No'}")
-print("")
-print("Submission file: rtx5090_submission.csv")
-print("Ready to dominate the competition!")
+#
+# # Create submission file
+# print("\nCreating submission file by accuracy...")
+#
+# submission_df = pd.DataFrame(columns=['id'] + list(vocab))
+# submission_df['id'] = test_features_df['id']
+# submission_df[list(vocab)] = ensemble_preds.numpy()
+#
+# # Save submission
+# submission_df.to_csv('submission_fast_ai_k_fold_accuracy.csv', index=False)
+#
+#
+# print("\nCreating submission file by loss...")
+#
+# submission_df = pd.DataFrame(columns=['id'] + list(vocab))
+# submission_df['id'] = test_features_df['id']
+# submission_df[list(vocab)] = ensemble_preds_loss.numpy()
+#
+# # Save submission
+# submission_df.to_csv('submission_fast_ai_k_fold_loss.csv', index=False)
+#
+#
+# print(f"\n{'='*50}")
+# print("RTX 5090 Submission File Created!")
+# print(f"{'='*50}")
+# print("=== Configuration Summary ===")
+# print(f"GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+# print(f"Model: {CFG.MODEL_ARCHITECTURE}")
+# print(f"Resolution: {CFG.IMAGE_SIZE}x{CFG.IMAGE_SIZE}")
+# print(f"Batch Size: {CFG.BATCH_SIZE}")
+# print(f"Total Training Epochs: {CFG.N_FOLDS * CFG.EPOCHS}")
+# print(f"Average Validation Accuracy: {avg_acc:.4f}")
+# print(f"Mixed Precision Training: {'Yes' if torch.cuda.is_available() else 'No'}")
+# print("")
+# print("Submission file: rtx5090_submission.csv")
+# print("Ready to dominate the competition!")

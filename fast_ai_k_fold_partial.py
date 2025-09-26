@@ -75,7 +75,7 @@ class CFG:
     # Competition settings
     TARGET_COL = 'label'
     SEED = 42
-    BASE_LR = 1e-3 / 2
+    BASE_LR = 1e-3
 
 print(f"RTX 5090 Configuration:")
 print(f"   Model: {CFG.MODEL_ARCHITECTURE}")
@@ -172,7 +172,7 @@ all_oof_preds = []
 fold_scores = []
 vocab = None
 
-for fold in range(CFG.N_FOLDS):
+for fold in range(4, CFG.N_FOLDS):
     print(f"\n{'='*50}")
     print(f"Fold {fold} - RTX 5090 Training")
     print(f"{'='*50}")
@@ -191,7 +191,7 @@ for fold in range(CFG.N_FOLDS):
         get_x=ColReader('image_path'),
         get_y=ColReader(CFG.TARGET_COL),
         splitter=get_splitter(fold),
-        item_tfms=[ Resize(CFG.IMAGE_SIZE, method=ResizeMethod.Pad, pad_mode=PadMode.Zeros) ],
+        item_tfms=Resize(CFG.IMAGE_SIZE, method=ResizeMethod.Pad, pad_mode=PadMode.Zeros),
         batch_tfms=[*get_transforms(), Normalize.from_stats(*imagenet_stats)]
     )
     

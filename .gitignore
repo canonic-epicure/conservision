@@ -17,6 +17,5 @@ wheels/
 /submission*.csv
 
 # checkpoints
-/models
-/models_*
+/models*
 /dividemix_checkpoint

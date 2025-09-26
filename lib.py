@@ -246,8 +246,6 @@ class ImagesDatasetResnet(Dataset):
 
 siglip2_training_transform = v2.Compose(
     [
-        RandomInvertIfGrayscale(p=0.3),
-
         LabCLAHE(),
         LabCLAHE(),
         v2.ToPILImage(),
@@ -350,7 +348,7 @@ def predict_siglip(model, data_loader: DataLoader, accumulate_probs=True, accumu
 
             if accumulate_probs:
                 # 2) apply softmax so that model outputs are in range [0,1]
-                preds = F.softmax(logits / T, dim=1)
+                preds = F.softmax(logits, dim=1)
                 # 3) store this batch's predictions in df
                 # note that PyTorch Tensors need to first be detached from their computational graph before converting to numpy arrays
                 preds_df = pd.DataFrame(
@@ -445,3 +443,155 @@ def sce_loss(logits, target, alpha=0.1, beta=1.0, num_classes=None, eps=1e-4):
 #         # косинусный спад из [1..floor_ratio]
 #         return floor_ratio + (1.0 - floor_ratio) * 0.5 * (1.0 + math.cos(math.pi * t))
 #     return f
+
+
+def choose_tau_from_val(logits, targets, T=1.0, target_prec=0.95, min_coverage=0.2):
+    """
+    logits_val: [N, K] логиты на валидации (без softmax), индекс i — объект, k — класс.
+    y_val:      [N] целочисленные метки 0..K-1.
+    T:          температура (T* после калибровки; если не калибровали — 1.0).
+    """
+    N = targets.numel()
+    probs = F.softmax(logits / T, dim=1)        # p_{i,k}
+    confidence, class_idx = probs.max(dim=1)                   # c_i, \hat y_i
+    correct = (class_idx == targets).to(torch.int32)   # r_i
+
+    # сортировка по уверенности по убыванию
+    confidence_sorted, confidence_sorted_idx = torch.sort(confidence, descending=True)
+    correct_sorted = correct[confidence_sorted_idx]
+
+    # кумулятивная точность на префиксе длины k
+    cum_correct = torch.cumsum(correct_sorted, dim=0)            # [N]
+    k = torch.arange(1, N + 1, device=logits.device)
+    prec_at_k = cum_correct.float() / k.float()
+    coverage = k.float() / float(N)
+
+    # ищем минимальный k с нужной точностью и покрытием
+    mask = (prec_at_k >= target_prec) & (coverage >= min_coverage)
+    if mask.any():
+        print("Has something with both precision and coverage: ")
+        k_star = torch.nonzero(mask, as_tuple=False)[0, 0].item()
+    else:
+        print("Fallback")
+        # fallback: лучший k по точности при покрытии >= min_coverage,
+        # иначе просто глобальный максимум точности
+        mask2 = coverage >= min_coverage
+        if mask2.any():
+            k_star = torch.argmax(prec_at_k * mask2.float()).item()
+        else:
+            k_star = torch.argmax(prec_at_k).item()
+
+    tau   = confidence_sorted[k_star].item()      # порог уверенности
+    a_tau = prec_at_k[k_star].item()        # точность среди отобранных
+    cov   = coverage[k_star].item()         # доля отобранных
+    return tau, a_tau, cov
+
+
+import torch
+import torch.nn.functional as F
+
+@torch.no_grad()
+def choose_tau_per_class_from_val(
+    logits_val: torch.Tensor,
+    y_val: torch.Tensor,
+    T: float = 1.0,
+    target_prec: float = 0.95,
+    min_coverage: float = 0.2,   # доля в пределах каждого предсказанного класса
+    min_count: int = 30,         # минимум примеров предсказанного класса для устойчивой оценки
+    measure: str = "conf",       # "conf" (=p_top1), "margin" (=p_top1 - p_top2), "entropy" (низкая лучше)
+):
+    """
+    Вход:
+      logits_val: [N, K] логиты на OOF/валидации (i — объект, k — класс)
+      y_val:      [N] истинные метки классов (0..K-1)
+      T:          температура (после калибровки)
+      target_prec: целевая точность среди отобранных в каждом классе
+      min_coverage: минимальная доля покрытия внутри каждого предсказанного класса
+      min_count:   минимально допустимое число предсказаний класса для подбора порога
+      measure:     как мерить «уверенность»:
+                   - "conf":     s_i = p_top1
+                   - "margin":   s_i = p_top1 - p_top2
+                   - "entropy":  s_i = - H(p_i), т.е. чем больше, тем увереннее
+
+    Выход:
+      tau_per_class:   [K] тензор порогов по measure для предсказанного класса k (NaN если нельзя оценить)
+      prec_per_class:  [K] достигнутая точность среди отобранных
+      cov_per_class:   [K] достигнутое покрытие (доля в пределах предсказанного класса)
+      counts_per_class:[K] число объектов, для которых \hat y_i = k
+      extras: dict с p (N,K), pred (N,), score s (N,), conf (N,), correct (N,)
+    """
+    assert logits_val.ndim == 2, "logits_val должен быть [N, K]"
+    N, K = logits_val.shape
+    device = logits_val.device
+
+    # 1) Вероятности и базовые величины
+    p = F.softmax(logits_val / T, dim=1)               # p_{i,k}
+    conf, pred = p.max(dim=1)                          # p_top1, \hat y_i
+    correct = (pred == y_val).to(torch.int32)          # r_i
+
+    # 2) Счёт уверенности s_i по выбранной мере
+    if measure == "conf":
+        s = conf                                        # p_top1
+    elif measure == "margin":
+        top2p, _ = p.topk(k=2, dim=1)                   # [N,2]
+        s = top2p[:, 0] - top2p[:, 1]                   # p_top1 - p_top2
+    elif measure == "entropy":
+        # Низкая энтропия => выше уверенность. Возьмём s = -H, чтобы сортировать по убыванию s.
+        eps = 1e-12
+        H = -(p * (p.clamp_min(eps)).log()).sum(dim=1)  # [N]
+        s = -H
+    else:
+        raise ValueError(f"Unknown measure: {measure}")
+
+    tau_per_class   = torch.full((K,), float('nan'), device=device)
+    prec_per_class  = torch.full((K,), float('nan'), device=device)
+    cov_per_class   = torch.full((K,), float('nan'), device=device)
+    counts_per_class= torch.zeros((K,), dtype=torch.long, device=device)
+
+    # 3) Перебор классов по предсказанию \hat y_i = k
+    for k in range(K):
+        mask_k = (pred == k)
+        n_k = int(mask_k.sum().item())
+        counts_per_class[k] = n_k
+
+        if n_k < max(1, min_count):
+            # Недостаточно примеров — оставим NaN; можно позже подставить глобальный порог
+            continue
+
+        s_k       = s[mask_k]
+        correct_k = correct[mask_k]
+
+        # Сортируем по убыванию score внутри класса k
+        s_sorted, idx = torch.sort(s_k, descending=True)
+        correct_sorted = correct_k[idx]
+
+        # Кумулятивная точность и покрытие относительно n_k
+        cum_correct = torch.cumsum(correct_sorted, dim=0)                 # [n_k]
+        kk = torch.arange(1, n_k + 1, device=device)
+        prec_at_kk = cum_correct.float() / kk.float()                     # точность на префиксе
+        cov_at_kk  = kk.float() / float(n_k)                              # покрытие внутри класса
+
+        # Ищем минимальный префикс, удовлетворяющий целям
+        mask_ok = (prec_at_kk >= target_prec) & (cov_at_kk >= min_coverage[k])
+        if mask_ok.any():
+            kk_star = torch.nonzero(mask_ok, as_tuple=False)[0, 0].item()
+        else:
+            # fallback 1: лучший по точности при покрытии >= min_coverage
+            mask_cov = (cov_at_kk >= min_coverage[k])
+            if mask_cov.any():
+                # argmax точности на допустимом покрытии
+                kk_star = torch.argmax(prec_at_kk * mask_cov.float()).item()
+            else:
+                # fallback 2: глобальный максимум точности на префиксе
+                kk_star = torch.argmax(prec_at_kk).item()
+
+        tau_k   = s_sorted[kk_star].item()
+        a_k     = prec_at_kk[kk_star].item()
+        cov_k   = cov_at_kk[kk_star].item()
+
+        tau_per_class[k]  = tau_k
+        prec_per_class[k] = a_k
+        cov_per_class[k]  = cov_k
+
+    extras = dict(p=p, pred=pred, score=s, conf=conf, correct=correct)
+    return tau_per_class, prec_per_class, cov_per_class, counts_per_class, extras
